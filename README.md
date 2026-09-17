@@ -101,3 +101,9 @@ adb shell "dd if=/tmp/boot.img of=/dev/block/sda7 bs=4096; sync"
 - 显示: 1440×2560 MIPI-DSI 命令模式 (i80), DECON `13930000`, SYSMMU `13a00000`/`13a10000`
 - 触摸: STMicroelectronics stmfts (i2c-2 @0x49)
 - WiFi/BT: Broadcom BCM4359 (PCIe) / BCM4349B1 (UART4)
+
+## 联系 / Contact
+
+- 邮箱 / Email: **1018514521@qq.com**
+
+欢迎交流 Exynos7420 / mainline Linux / Panfrost 相关问题。
