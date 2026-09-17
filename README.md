@@ -7,6 +7,11 @@ Ubuntu 24.04 (arm64) + GNOME 46 的移植工作，重点记录 **显示 IOMMU/SY
 > 主线内核本身不支持这台机器，本仓库包含了使其可用所需的全部内核改动、
 > 打包工具、可刷写镜像和完整的技术文档。
 
+![SM-G9280 运行 Ubuntu 24.04.5 LTS / GNOME 46 / Wayland / Linux 6.6.0 / Mali-T760 (Panfrost)](docs/screenshots/ubuntu-24.04-gnome46-mali-t760.jpg)
+
+*SM-G9280 (Exynos7420) 运行 Ubuntu 24.04.5 LTS + GNOME 46 (Wayland) + Linux 6.6.0，
+显卡识别为 Mali-T760 (Panfrost)，8 核 (4×Cortex-A53 + 4×Cortex-A57)。*
+
 ---
 
 ## 里程碑（已实现）
