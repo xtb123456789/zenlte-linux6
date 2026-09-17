@@ -1,0 +1,23 @@
+<monitors version="2">
+  <configuration>
+    <logicalmonitor>
+      <x>0</x>
+      <y>0</y>
+      <scale>2</scale>
+      <primary>yes</primary>
+      <monitor>
+        <monitorspec>
+          <connector>VGA-1</connector>
+          <vendor>unknown</vendor>
+          <product>unknown</product>
+          <serial>unknown</serial>
+        </monitorspec>
+        <mode>
+          <width>1440</width>
+          <height>2560</height>
+          <rate>59.800</rate>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+  </configuration>
+</monitors>

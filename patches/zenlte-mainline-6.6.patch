@@ -1,0 +1,1562 @@
+--- a/drivers/iommu/exynos-iommu.c
++++ b/drivers/iommu/exynos-iommu.c
+@@ -20,6 +20,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/sizes.h>
+ #include <linux/slab.h>
+ 
+ typedef u32 sysmmu_iova_t;
+@@ -234,6 +235,7 @@
+ 	struct list_head controllers;	/* list of sysmmu_drvdata.owner_node */
+ 	struct iommu_domain *domain;	/* domain this device is attached */
+ 	struct mutex rpm_lock;		/* for runtime pm of all sysmmus */
++	bool ready;			/* master uses IOVA-mapped buffers */
+ };
+ 
+ /*
+@@ -481,10 +483,16 @@
+ 
+ static void __sysmmu_enable_clocks(struct sysmmu_drvdata *data)
+ {
++	pr_emerg("IOMMU: enable_clocks %s master=%s\n", dev_name(data->sysmmu),
++		 data->clk_master ? "yes" : "NULL");
+ 	BUG_ON(clk_prepare_enable(data->clk_master));
++	pr_emerg("IOMMU: enable_clocks %s clk\n", dev_name(data->sysmmu));
+ 	BUG_ON(clk_prepare_enable(data->clk));
++	pr_emerg("IOMMU: enable_clocks %s pclk\n", dev_name(data->sysmmu));
+ 	BUG_ON(clk_prepare_enable(data->pclk));
++	pr_emerg("IOMMU: enable_clocks %s aclk\n", dev_name(data->sysmmu));
+ 	BUG_ON(clk_prepare_enable(data->aclk));
++	pr_emerg("IOMMU: enable_clocks %s all on\n", dev_name(data->sysmmu));
+ }
+ 
+ static void __sysmmu_disable_clocks(struct sysmmu_drvdata *data)
+@@ -584,8 +592,14 @@
+ 		ret = report_iommu_fault(&data->domain->domain, data->master,
+ 					 fault.addr, fault.type);
+ 	}
++	/*
++	 * The vendor display driver installs a fault handler that dumps the
++	 * DECON state and keeps running.  Do not panic here: a transient
++	 * fault during the bootloader->DRM framebuffer handover should not
++	 * wedge the whole system.
++	 */
+ 	if (ret)
+-		panic("Unrecoverable System MMU Fault!");
++		dev_err(data->sysmmu, "Unrecoverable System MMU Fault! (ignored)\n");
+ 
+ out:
+ 	writel(1 << itype, SYSMMU_REG(data, int_clear));
+@@ -645,6 +659,7 @@
+ {
+ 	unsigned long flags;
+ 
++	pr_emerg("IOMMU: __sysmmu_enable %s enter\n", dev_name(data->sysmmu));
+ 	__sysmmu_enable_clocks(data);
+ 
+ 	spin_lock_irqsave(&data->lock, flags);
+@@ -655,6 +670,13 @@
+ 	writel(CTRL_ENABLE, data->sfrbase + REG_MMU_CTRL);
+ 	data->active = true;
+ 	spin_unlock_irqrestore(&data->lock, flags);
++
++	pr_emerg("IOMMU: __sysmmu_enable %s wrote ctrl\n",
++		 dev_name(data->sysmmu));
++	pr_emerg("IOMMU: __sysmmu_enable %s ctrl=%#x status=%#x\n",
++		 dev_name(data->sysmmu),
++		 readl(data->sfrbase + REG_MMU_CTRL),
++		 readl(data->sfrbase + REG_MMU_STATUS));
+ 
+ 	/*
+ 	 * SYSMMU driver keeps master's clock enabled only for the short
+@@ -771,7 +793,21 @@
+ 	data->sysmmu = dev;
+ 	spin_lock_init(&data->lock);
+ 
+-	__sysmmu_get_version(data);
++	/*
++	 * On Exynos7420 the SYSMMU sits on the live display path. Toggling its
++	 * aclk/pclk and reading REG_MMU_VERSION at probe time (very early boot,
++	 * before the display driver brings up the DISP clocks) stalls the DECON
++	 * AXI path and hangs the whole system. The hardware is always SysMMU
++	 * v6 here, so set it statically and defer any register access to the
++	 * first __sysmmu_enable() when the master has powered the block.
++	 */
++	if (IS_ENABLED(CONFIG_ARM64) &&
++	    of_device_is_compatible(dev->of_node, "samsung,exynos-sysmmu")) {
++		data->version = MAKE_MMU_VER(6, 0);
++		data->variant = &sysmmu_v5_variant;
++	} else {
++		__sysmmu_get_version(data);
++	}
+ 
+ 	ret = iommu_device_sysfs_add(&data->iommu, &pdev->dev, NULL,
+ 				     dev_name(data->sysmmu));
+@@ -809,13 +845,20 @@
+ 
+ 	pm_runtime_enable(dev);
+ 
++	pr_emerg("IOMMU: probe %s before iommu_device_register\n",
++		 dev_name(dev));
+ 	ret = iommu_device_register(&data->iommu, &exynos_iommu_ops, dev);
++	pr_emerg("IOMMU: probe %s iommu_device_register ret=%d\n",
++		 dev_name(dev), ret);
+ 	if (ret)
+ 		goto err_dma_set_mask;
+ 
+ 	return 0;
+ 
+ err_dma_set_mask:
++	pm_runtime_disable(dev);
++	if (dma_dev == dev)
++		dma_dev = NULL;
+ 	iommu_device_sysfs_remove(&data->iommu);
+ 	return ret;
+ }
+@@ -829,7 +872,9 @@
+ 		struct exynos_iommu_owner *owner = dev_iommu_priv_get(master);
+ 
+ 		mutex_lock(&owner->rpm_lock);
+-		if (data->domain) {
++		pr_emerg("IOMMU: sysmmu_suspend %s domain=%d active=%d\n",
++			 dev_name(dev), !!data->domain, data->active);
++		if (data->domain && data->active) {
+ 			dev_dbg(data->sysmmu, "saving state\n");
+ 			__sysmmu_disable(data);
+ 		}
+@@ -847,10 +892,22 @@
+ 		struct exynos_iommu_owner *owner = dev_iommu_priv_get(master);
+ 
+ 		mutex_lock(&owner->rpm_lock);
+-		if (data->domain) {
++		pr_emerg("IOMMU: sysmmu_resume %s domain=%d active=%d ready=%d\n",
++			 dev_name(dev), !!data->domain, data->active,
++			 owner->ready);
++		/*
++		 * Do not touch the SYSMMU until the master has told us that it
++		 * is scanning an IOVA-mapped buffer.  Bringing the SYSMMU up
++		 * earlier makes DECON fault on the bootloader's physical
++		 * framebuffer (and, with the master clock wired up, momentarily
++		 * gates the master's clock), which wedges the interconnect.
++		 */
++		if (data->domain && owner->ready && !data->active) {
+ 			dev_dbg(data->sysmmu, "restoring state\n");
+ 			__sysmmu_enable(data);
+ 		}
++		pr_emerg("IOMMU: sysmmu_resume %s done active=%d\n",
++			 dev_name(dev), data->active);
+ 		mutex_unlock(&owner->rpm_lock);
+ 	}
+ 	return 0;
+@@ -1046,10 +1103,19 @@
+ 	owner->domain = iommu_domain;
+ 	spin_unlock_irqrestore(&domain->lock, flags);
+ 
++	pr_emerg("IOMMU: attach master=%s\n", dev_name(dev));
++
+ 	list_for_each_entry(data, &owner->controllers, owner_node) {
++		pr_emerg("IOMMU: attach sysmmu=%s active=%d domain=%d\n",
++			 dev_name(data->sysmmu),
++			 pm_runtime_active(data->sysmmu),
++			 !!data->domain);
+ 		pm_runtime_get_noresume(data->sysmmu);
+-		if (pm_runtime_active(data->sysmmu))
++		if (pm_runtime_active(data->sysmmu)) {
++			pr_emerg("IOMMU: attach enabling %s now\n",
++				 dev_name(data->sysmmu));
+ 			__sysmmu_enable(data);
++		}
+ 		pm_runtime_put(data->sysmmu);
+ 	}
+ 
+@@ -1059,8 +1125,70 @@
+ 		&pagetable);
+ 
+ 	return 0;
++}
++
++/*
++ * exynos_iommu_master_ready - let the IOMMU translate for the master
++ * @master: the master device (e.g. DECON) whose SYSMMUs should be enabled
++ *
++ * The master driver calls this once it is actually scanning a buffer that was
++ * mapped through this IOMMU domain.  Until then the SYSMMUs are left disabled,
++ * because enabling them while the hardware still scans a bootloader-provided
++ * physical framebuffer causes unrecoverable translation faults.
++ */
++void exynos_iommu_master_ready(struct device *master)
++{
++	struct exynos_iommu_owner *owner = dev_iommu_priv_get(master);
++	struct sysmmu_drvdata *data;
++
++	if (!owner)
++		return;
++
++	mutex_lock(&owner->rpm_lock);
++	if (!owner->ready) {
++		owner->ready = true;
++		list_for_each_entry(data, &owner->controllers, owner_node) {
++			if (data->domain && !data->active) {
++				pr_emerg("IOMMU: master_ready enabling %s\n",
++					 dev_name(data->sysmmu));
++				__sysmmu_enable(data);
++			}
++		}
++	}
++	mutex_unlock(&owner->rpm_lock);
+ }
++EXPORT_SYMBOL_GPL(exynos_iommu_master_ready);
+ 
++/*
++ * exynos_iommu_map_identity - map a physical range one-to-one
++ * @master: master device whose IOMMU domain should be used
++ * @phys: physical address of the range
++ * @size: size of the range in bytes
++ *
++ * Used by the display driver to keep the bootloader's framebuffer readable
++ * after the SYSMMUs start translating.  Mirrors the vendor iovmm_map_oto().
++ */
++int exynos_iommu_map_identity(struct device *master, phys_addr_t phys,
++			      size_t size)
++{
++	struct exynos_iommu_owner *owner = dev_iommu_priv_get(master);
++	phys_addr_t start, end;
++	int ret;
++
++	if (!owner || !owner->domain)
++		return -ENODEV;
++
++	start = ALIGN_DOWN(phys, SZ_2M);
++	end = ALIGN(phys + size, SZ_2M);
++
++	ret = iommu_map(owner->domain, start, start, end - start,
++			IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
++	pr_emerg("IOMMU: map_identity %s phys=%pa start=%pa size=%#zx ret=%d\n",
++		 dev_name(master), &phys, &start, (size_t)(end - start), ret);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(exynos_iommu_map_identity);
++
+ static sysmmu_pte_t *alloc_lv2entry(struct exynos_iommu_domain *domain,
+ 		sysmmu_pte_t *sent, sysmmu_iova_t iova, short *pgcounter)
+ {
+@@ -1398,6 +1526,9 @@
+ 		data->link = device_link_add(dev, data->sysmmu,
+ 					     DL_FLAG_STATELESS |
+ 					     DL_FLAG_PM_RUNTIME);
++		pr_emerg("IOMMU: probe_device %s link=%s to %s\n",
++			 dev_name(dev), data->link ? "ok" : "NULL",
++			 dev_name(data->sysmmu));
+ 	}
+ 
+ 	/* There is always at least one entry, see exynos_iommu_of_xlate() */
+@@ -1445,8 +1576,10 @@
+ 	data = platform_get_drvdata(sysmmu);
+ 	if (!data) {
+ 		put_device(&sysmmu->dev);
+-		return -ENODEV;
++		return -EPROBE_DEFER;
+ 	}
++	pr_emerg("IOMMU: of_xlate master=%s sysmmu=%s\n", dev_name(dev),
++		 dev_name(&sysmmu->dev));
+ 
+ 	if (!owner) {
+ 		owner = kzalloc(sizeof(*owner), GFP_KERNEL);
+@@ -1471,6 +1604,7 @@
+ }
+ 
+ static const struct iommu_ops exynos_iommu_ops = {
++	.owner = THIS_MODULE,
+ 	.domain_alloc = exynos_iommu_domain_alloc,
+ 	.device_group = generic_device_group,
+ #ifdef CONFIG_ARM
+@@ -1515,7 +1649,9 @@
+ 		goto err_zero_lv2;
+ 	}
+ 
++	pr_emerg("IOMMU: init enter\n");
+ 	ret = platform_driver_register(&exynos_sysmmu_driver);
++	pr_emerg("IOMMU: platform_driver_register ret=%d\n", ret);
+ 	if (ret) {
+ 		pr_err("%s: Failed to register driver\n", __func__);
+ 		goto err_reg_driver;
+@@ -1528,4 +1664,16 @@
+ 	kmem_cache_destroy(lv2table_kmem_cache);
+ 	return ret;
+ }
+-core_initcall(exynos_iommu_init);
++
++static void __exit exynos_iommu_exit(void)
++{
++	platform_driver_unregister(&exynos_sysmmu_driver);
++	kmem_cache_free(lv2table_kmem_cache, zero_lv2_table);
++	kmem_cache_destroy(lv2table_kmem_cache);
++}
++
++module_init(exynos_iommu_init);
++module_exit(exynos_iommu_exit);
++
++MODULE_DESCRIPTION("Samsung Exynos IOMMU (System MMU) driver");
++MODULE_LICENSE("GPL v2");
+--- a/drivers/iommu/Kconfig
++++ b/drivers/iommu/Kconfig
+@@ -258,7 +258,7 @@
+ 	  SoCs (Tegra30 up to Tegra210).
+ 
+ config EXYNOS_IOMMU
+-	bool "Exynos IOMMU Support"
++	tristate "Exynos IOMMU Support"
+ 	depends on ARCH_EXYNOS || COMPILE_TEST
+ 	depends on !CPU_BIG_ENDIAN # revisit driver if we can enable big-endian ptes
+ 	select IOMMU_API
+--- a/drivers/clk/samsung/clk-exynos7.c
++++ b/drivers/clk/samsung/clk-exynos7.c
+@@ -215,12 +215,15 @@
+ #define MUX_SEL_TOP0_PERIC1		0x0234
+ #define MUX_SEL_TOP0_PERIC2		0x0238
+ #define MUX_SEL_TOP0_PERIC3		0x023C
++#define MUX_SEL_TOP0_DISP		0x0220
+ #define DIV_TOP03			0x060C
+ #define DIV_TOP0_PERIC0			0x0630
+ #define DIV_TOP0_PERIC1			0x0634
+ #define DIV_TOP0_PERIC2			0x0638
+ #define DIV_TOP0_PERIC3			0x063C
++#define DIV_TOP0_DISP			0x0620
+ #define ENABLE_ACLK_TOP03		0x080C
++#define ENABLE_SCLK_TOP0_DISP		0x0A20
+ #define ENABLE_SCLK_TOP0_PERIC0		0x0A30
+ #define ENABLE_SCLK_TOP0_PERIC1		0x0A34
+ #define ENABLE_SCLK_TOP0_PERIC2		0x0A38
+@@ -251,20 +254,33 @@
+ 	"mout_top0_bus1_pll_half"};
+ PNAME(mout_top0_group4) = {"ioclk_audiocdclk1", "mout_top0_aud_pll_user",
+ 	"mout_top0_bus0_pll_half", "mout_top0_bus1_pll_half"};
++
++PNAME(mout_top0_disp_p) = {"mout_top0_bus0_pll_half",
++	"mout_top0_bus1_pll_half", "mout_top0_cc_pll_half",
++	"mout_top0_mfc_pll_half"};
++PNAME(mout_aclk_disp_400_p) = {"mout_top0_bus0_pll_half",
++	"mout_top0_bus1_pll_half", "mout_top0_cc_pll_half",
++	"mout_top0_mfc_pll_half", "ffac_top0_bus0_pll_div2",
++	"ffac_top0_bus1_pll_div2", "ffac_top0_cc_pll_div2",
++	"ffac_top0_mfc_pll_div2"};
+ 
+ static const unsigned long top0_clk_regs[] __initconst = {
+ 	MUX_SEL_TOP00,
+ 	MUX_SEL_TOP01,
+ 	MUX_SEL_TOP03,
++	MUX_SEL_TOP0_DISP,
+ 	MUX_SEL_TOP0_PERIC0,
+ 	MUX_SEL_TOP0_PERIC1,
+ 	MUX_SEL_TOP0_PERIC2,
+ 	MUX_SEL_TOP0_PERIC3,
+ 	DIV_TOP03,
++	DIV_TOP0_DISP,
+ 	DIV_TOP0_PERIC0,
+ 	DIV_TOP0_PERIC1,
+ 	DIV_TOP0_PERIC2,
+ 	DIV_TOP0_PERIC3,
++	ENABLE_ACLK_TOP03,
++	ENABLE_SCLK_TOP0_DISP,
+ 	ENABLE_SCLK_TOP0_PERIC0,
+ 	ENABLE_SCLK_TOP0_PERIC1,
+ 	ENABLE_SCLK_TOP0_PERIC2,
+@@ -309,6 +325,13 @@
+ 	MUX(0, "mout_sclk_uart1", mout_top0_group1, MUX_SEL_TOP0_PERIC3, 12, 2),
+ 	MUX(0, "mout_sclk_uart0", mout_top0_group1, MUX_SEL_TOP0_PERIC3, 16, 2),
+ 	MUX(0, "mout_sclk_spi4", mout_top0_group1, MUX_SEL_TOP0_PERIC3, 20, 2),
++
++	MUX(CLK_MOUT_ACLK_DISP_400, "mout_aclk_disp_400", mout_aclk_disp_400_p,
++		MUX_SEL_TOP03, 28, 3),
++	MUX(CLK_MOUT_SCLK_DECON_INT_ECLK, "mout_sclk_decon_int_eclk",
++		mout_top0_disp_p, MUX_SEL_TOP0_DISP, 28, 2),
++	MUX(CLK_MOUT_SCLK_DECON_VCLK, "mout_sclk_decon_vclk",
++		mout_top0_disp_p, MUX_SEL_TOP0_DISP, 20, 2),
+ };
+ 
+ static const struct samsung_div_clock top0_div_clks[] __initconst = {
+@@ -332,13 +355,28 @@
+ 	DIV(0, "dout_sclk_uart1", "mout_sclk_uart1", DIV_TOP0_PERIC3, 12, 4),
+ 	DIV(0, "dout_sclk_uart0", "mout_sclk_uart0", DIV_TOP0_PERIC3, 16, 4),
+ 	DIV(0, "dout_sclk_spi4", "mout_sclk_spi4", DIV_TOP0_PERIC3, 20, 12),
++
++	DIV(CLK_DOUT_ACLK_DISP_400, "dout_aclk_disp_400", "mout_aclk_disp_400",
++		DIV_TOP03, 28, 1),
++	DIV(CLK_DOUT_SCLK_DECON_INT_ECLK, "dout_sclk_decon_int_eclk",
++		"mout_sclk_decon_int_eclk", DIV_TOP0_DISP, 28, 4),
++	DIV(CLK_DOUT_SCLK_DECON_VCLK, "dout_sclk_decon_vclk",
++		"mout_sclk_decon_vclk", DIV_TOP0_DISP, 20, 4),
+ };
+ 
+ static const struct samsung_gate_clock top0_gate_clks[] __initconst = {
+-	GATE(CLK_ACLK_PERIC0_66, "aclk_peric0_66", "dout_aclk_peric0_66",
+-		ENABLE_ACLK_TOP03, 20, CLK_SET_RATE_PARENT, 0),
++	/*
++	 * These clocks are required for the CMU_PERIC0/1 registers access,
++	 * keep them enabled permanently until proper runtime PM support is
++	 * added. Otherwise disabling a PERIC child clock (e.g. an UART gate)
++	 * gates the CMU register interface and the next access hangs the bus.
++	 */
++	GATE(CLK_ACLK_PERIC0_66, "aclk_peric0_66", "dout_aclk_peric0_66",
++		ENABLE_ACLK_TOP03, 20, CLK_SET_RATE_PARENT |
++		CLK_IS_CRITICAL, 0),
+ 	GATE(CLK_ACLK_PERIC1_66, "aclk_peric1_66", "dout_aclk_peric1_66",
+-		ENABLE_ACLK_TOP03, 12, CLK_SET_RATE_PARENT, 0),
++		ENABLE_ACLK_TOP03, 12, CLK_SET_RATE_PARENT |
++		CLK_IS_CRITICAL, 0),
+ 
+ 	GATE(CLK_SCLK_SPDIF, "sclk_spdif", "dout_sclk_spdif",
+ 		ENABLE_SCLK_TOP0_PERIC0, 4, CLK_SET_RATE_PARENT, 0),
+@@ -366,6 +404,13 @@
+ 		ENABLE_SCLK_TOP0_PERIC3, 16, 0, 0),
+ 	GATE(CLK_SCLK_SPI4, "sclk_spi4", "dout_sclk_spi4",
+ 		ENABLE_SCLK_TOP0_PERIC3, 20, CLK_SET_RATE_PARENT, 0),
++
++	GATE(CLK_ACLK_DISP_400, "top_aclk_disp_400", "dout_aclk_disp_400",
++		ENABLE_ACLK_TOP03, 28, 0, 0),
++	GATE(CLK_SCLK_DECON_INT_ECLK, "top_sclk_decon_int_eclk",
++		"dout_sclk_decon_int_eclk", ENABLE_SCLK_TOP0_DISP, 28, 0, 0),
++	GATE(CLK_SCLK_DECON_VCLK, "top_sclk_decon_vclk",
++		"dout_sclk_decon_vclk", ENABLE_SCLK_TOP0_DISP, 20, 0, 0),
+ };
+ 
+ static const struct samsung_fixed_factor_clock top0_fixed_factor_clks[] __initconst = {
+@@ -595,6 +640,7 @@
+ 
+ static const unsigned long ccore_clk_regs[] __initconst = {
+ 	MUX_SEL_CCORE,
++	ENABLE_ACLK_CCORE0,
+ 	ENABLE_PCLK_CCORE,
+ };
+ 
+@@ -606,6 +652,15 @@
+ static const struct samsung_gate_clock ccore_gate_clks[] __initconst = {
+ 	GATE(PCLK_RTC, "pclk_rtc", "mout_aclk_ccore_133_user",
+ 		ENABLE_PCLK_CCORE, 8, 0, 0),
++	/*
++	 * G3D async-bridge (LH) clocks.  The vendor enables them as part of the
++	 * G3D power-on sequence; the GPU needs them for its bus accesses.  Keep
++	 * them always on so the Mali GPU does not hit bus faults / job timeouts.
++	 */
++	GATE(0, "aclk_lh_g3d0", "mout_aclk_ccore_133_user",
++		ENABLE_ACLK_CCORE0, 22, CLK_IS_CRITICAL, 0),
++	GATE(0, "aclk_lh_g3d1", "mout_aclk_ccore_133_user",
++		ENABLE_ACLK_CCORE0, 23, CLK_IS_CRITICAL, 0),
+ };
+ 
+ static const struct samsung_cmu_info ccore_cmu_info __initconst = {
+@@ -841,6 +896,8 @@
+ };
+ 
+ static const struct samsung_gate_clock peris_gate_clks[] __initconst = {
++	GATE(PCLK_MCT, "pclk_mct", "mout_aclk_peris_66_user",
++		ENABLE_PCLK_PERIS, 5, 0, 0),
+ 	GATE(PCLK_WDT, "pclk_wdt", "mout_aclk_peris_66_user",
+ 		ENABLE_PCLK_PERIS, 6, 0, 0),
+ 	GATE(PCLK_TMU, "pclk_tmu_apbif", "mout_aclk_peris_66_user",
+@@ -1272,7 +1329,8 @@
+ 			ENABLE_SCLK_AUD, 27, CLK_SET_RATE_PARENT, 0),
+ 	GATE(SCLK_I2S, "sclk_i2s", "dout_sclk_i2s",
+ 			ENABLE_SCLK_AUD, 28, CLK_SET_RATE_PARENT, 0),
+-	GATE(0, "sclk_uart", "dout_sclk_uart", ENABLE_SCLK_AUD, 29, 0, 0),
++	GATE(SCLK_UART, "sclk_uart", "dout_sclk_uart",
++			ENABLE_SCLK_AUD, 29, 0, 0),
+ 	GATE(0, "sclk_slimbus", "dout_sclk_slimbus",
+ 			ENABLE_SCLK_AUD, 30, 0, 0),
+ 
+@@ -1281,7 +1339,8 @@
+ 	GATE(0, "pclk_wdt1", "dout_aclk_aud", ENABLE_PCLK_AUD, 22, 0, 0),
+ 	GATE(0, "pclk_wdt0", "dout_aclk_aud", ENABLE_PCLK_AUD, 23, 0, 0),
+ 	GATE(0, "pclk_slimbus", "dout_aclk_aud", ENABLE_PCLK_AUD, 24, 0, 0),
+-	GATE(0, "pclk_uart", "dout_aclk_aud", ENABLE_PCLK_AUD, 25, 0, 0),
++	GATE(PCLK_UART, "pclk_uart", "dout_aclk_aud",
++			ENABLE_PCLK_AUD, 25, 0, 0),
+ 	GATE(PCLK_PCM, "pclk_pcm", "dout_aclk_aud",
+ 			ENABLE_PCLK_AUD, 26, CLK_SET_RATE_PARENT, 0),
+ 	GATE(PCLK_I2S, "pclk_i2s", "dout_aclk_aud",
+@@ -1314,3 +1373,199 @@
+ 
+ CLK_OF_DECLARE(exynos7_clk_aud, "samsung,exynos7-clock-aud",
+ 		exynos7_clk_aud_init);
++
++/* Register Offset definitions for CMU_G3D (0x14AA0000) */
++#define G3D_PLL_LOCK			0x0000
++#define G3D_PLL_CON0			0x0100
++#define MUX_SEL_G3D			0x0200
++#define MUX_ENABLE_G3D			0x0300
++#define MUX_STAT_G3D			0x0400
++#define DIV_G3D				0x0600
++#define DIV_STAT_G3D			0x0700
++#define ENABLE_ACLK_G3D			0x0800
++#define ENABLE_PCLK_G3D			0x0900
++#define ENABLE_SCLK_G3D			0x0a00
++#define ENABLE_IP_G3D0			0x0b00
++
++PNAME(mout_aclk_g3d_400_p) = { "fout_g3d_pll", "fin_pll" };
++
++static const struct samsung_fixed_rate_clock g3d_fixed_clks[] __initconst = {
++	FRATE(CLK_FOUT_G3D_PLL, "fout_g3d_pll", NULL, 0, 700000000),
++};
++
++static const struct samsung_mux_clock g3d_mux_clks[] __initconst = {
++	MUX(CLK_MOUT_ACLK_G3D_400, "mout_aclk_g3d_400", mout_aclk_g3d_400_p,
++			MUX_SEL_G3D, 8, 1),
++};
++
++static const struct samsung_div_clock g3d_div_clks[] __initconst = {
++	DIV(CLK_DIV_ACLK_G3D, "div_aclk_g3d", "mout_aclk_g3d_400",
++			DIV_G3D, 0, 3),
++	DIV(CLK_DIV_PCLK_G3D, "div_pclk_g3d", "div_aclk_g3d",
++			DIV_G3D, 4, 3),
++};
++
++static const struct samsung_gate_clock g3d_gate_clks[] __initconst = {
++	GATE(CLK_ACLK_G3D, "aclk_g3d", "div_aclk_g3d",
++			ENABLE_ACLK_G3D, 0, CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_PCLK_SYSREG_G3D, "pclk_sysreg_g3d", "div_pclk_g3d",
++			ENABLE_PCLK_G3D, 0, CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_PCLK_PMU_G3D, "pclk_pmu_g3d", "div_pclk_g3d",
++			ENABLE_PCLK_G3D, 1, CLK_IGNORE_UNUSED, 0),
++};
++
++static const unsigned long g3d_clk_regs[] __initconst = {
++	MUX_SEL_G3D,
++	DIV_G3D,
++	ENABLE_ACLK_G3D,
++	ENABLE_PCLK_G3D,
++	ENABLE_SCLK_G3D,
++};
++
++static const struct samsung_cmu_info g3d_cmu_info __initconst = {
++	.fixed_clks		= g3d_fixed_clks,
++	.nr_fixed_clks		= ARRAY_SIZE(g3d_fixed_clks),
++	.mux_clks		= g3d_mux_clks,
++	.nr_mux_clks		= ARRAY_SIZE(g3d_mux_clks),
++	.div_clks		= g3d_div_clks,
++	.nr_div_clks		= ARRAY_SIZE(g3d_div_clks),
++	.gate_clks		= g3d_gate_clks,
++	.nr_gate_clks		= ARRAY_SIZE(g3d_gate_clks),
++	.nr_clk_ids		= G3D_NR_CLK,
++	.clk_regs		= g3d_clk_regs,
++	.nr_clk_regs		= ARRAY_SIZE(g3d_clk_regs),
++};
++
++static void __init exynos7_clk_g3d_init(struct device_node *np)
++{
++	samsung_cmu_register_one(np, &g3d_cmu_info);
++}
++
++CLK_OF_DECLARE(exynos7_clk_g3d, "samsung,exynos7-clock-g3d",
++		exynos7_clk_g3d_init);
++
++/* Register Offset definitions for CMU_DISP (0x13AD0000) */
++#define DISP_PLL_LOCK			0x0000
++#define DISP_PLL_CON0			0x0100
++#define MUX_SEL_DISP0			0x0200
++#define MUX_SEL_DISP1			0x0204
++#define MUX_SEL_DISP3			0x020C
++#define DIV_DISP			0x0600
++#define ENABLE_ACLK_DISP		0x0800
++#define ENABLE_ACLK_DISP_RO_SMMU	0x0804
++#define ENABLE_ACLK_DISP_RW_SMMU	0x0808
++#define ENABLE_PCLK_DISP		0x0900
++#define ENABLE_PCLK_DISP_RO_SMMU	0x0904
++#define ENABLE_PCLK_DISP_RW_SMMU	0x0908
++#define ENABLE_SCLK_DISP1		0x0A04
++#define ENABLE_SCLK_DISP2		0x0A08
++
++static const struct samsung_pll_rate_table disp_pll_tbl[] __initconst = {
++	PLL_36XX_RATE(24 * MHZ, 252000000, 42, 2, 1, 0),
++	PLL_36XX_RATE(24 * MHZ, 240000000, 20, 1, 1, 0),
++	PLL_36XX_RATE(24 * MHZ, 142000000, 71, 3, 2, 0),
++	PLL_36XX_RATE(24 * MHZ, 126000000, 21, 1, 2, 0),
++	PLL_36XX_RATE(24 * MHZ, 96000000, 32, 1, 3, 0),
++	{},
++};
++
++PNAME(mout_sub_sclk_decon_int_eclk_p) = { "top_sclk_decon_int_eclk",
++	"disp_pll" };
++PNAME(mout_sub_sclk_decon_int_vclk_p) = { "top_sclk_decon_vclk",
++	"disp_pll" };
++
++static const struct samsung_pll_clock disp_pll_clks[] __initconst = {
++	PLL(pll_1460x, CLK_FOUT_DISP_PLL, "disp_pll", "fin_pll",
++		DISP_PLL_LOCK, DISP_PLL_CON0, disp_pll_tbl),
++};
++
++static const struct samsung_mux_clock disp_mux_clks[] __initconst = {
++	MUX(CLK_MOUT_SUB_SCLK_DECON_INT_ECLK, "mout_sub_sclk_decon_int_eclk",
++		mout_sub_sclk_decon_int_eclk_p, MUX_SEL_DISP3, 20, 1),
++	MUX(CLK_MOUT_SUB_SCLK_DECON_INT_VCLK, "mout_sub_sclk_decon_int_vclk",
++		mout_sub_sclk_decon_int_vclk_p, MUX_SEL_DISP3, 12, 1),
++};
++
++static const struct samsung_div_clock disp_div_clks[] __initconst = {
++	DIV(CLK_DOUT_PCLK_DISP, "dout_pclk_disp", "top_aclk_disp_400",
++		DIV_DISP, 0, 2),
++	DIV(CLK_DOUT_SUB_SCLK_DECON_INT_ECLK,
++		"dout_sub_sclk_decon_int_eclk",
++		"mout_sub_sclk_decon_int_eclk", DIV_DISP, 20, 3),
++	DIV(CLK_DOUT_SUB_SCLK_DECON_INT_VCLK,
++		"dout_sub_sclk_decon_int_vclk",
++		"mout_sub_sclk_decon_int_vclk", DIV_DISP, 12, 3),
++};
++
++static const struct samsung_gate_clock disp_gate_clks[] __initconst = {
++	GATE(CLK_ACLK_DECON0, "aclk_decon0", "aclk_xiu_disp_ro",
++		ENABLE_ACLK_DISP, 31, CLK_IGNORE_UNUSED, 0),
++	GATE(0, "aclk_xiu_disp_ro", "aclk_lh_async_si_r_top_disp",
++		ENABLE_ACLK_DISP, 27, CLK_IGNORE_UNUSED, 0),
++	GATE(0, "aclk_lh_async_si_r_top_disp", "top_aclk_disp_400",
++		ENABLE_ACLK_DISP, 29, CLK_IGNORE_UNUSED, 0),
++
++	GATE(CLK_PCLK_DECON0, "pclk_decon0", "dout_pclk_disp",
++		ENABLE_PCLK_DISP, 31, CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_PCLK_DSIM0, "pclk_dsim0", "dout_pclk_disp",
++		ENABLE_PCLK_DISP, 29, CLK_IGNORE_UNUSED, 0),
++
++	GATE(CLK_ACLK_DISP_RO_SYSMMU, "aclk_smmu_disp_ro",
++		"top_aclk_disp_400", ENABLE_ACLK_DISP_RO_SMMU, 0,
++		0, 0),
++	GATE(CLK_ACLK_DISP_RW_SYSMMU, "aclk_smmu_disp_rw",
++		"top_aclk_disp_400", ENABLE_ACLK_DISP_RW_SMMU, 0,
++		0, 0),
++	GATE(CLK_PCLK_DISP_RO_SYSMMU, "pclk_smmu_disp_ro",
++		"dout_pclk_disp", ENABLE_PCLK_DISP_RO_SMMU, 0,
++		0, 0),
++	GATE(CLK_PCLK_DISP_RW_SYSMMU, "pclk_smmu_disp_rw",
++		"dout_pclk_disp", ENABLE_PCLK_DISP_RW_SMMU, 0,
++		0, 0),
++
++	GATE(CLK_SCLK_DECON0_ECLK, "decon0_eclk",
++		"dout_sub_sclk_decon_int_eclk", ENABLE_SCLK_DISP1, 28,
++		CLK_IGNORE_UNUSED, 0),
++	GATE(CLK_SCLK_DECON0_VCLK, "decon0_vclk",
++		"dout_sub_sclk_decon_int_vclk", ENABLE_SCLK_DISP1, 8,
++		CLK_IGNORE_UNUSED, 0),
++};
++
++static const unsigned long disp_clk_regs[] __initconst = {
++	DISP_PLL_LOCK,
++	DISP_PLL_CON0,
++	MUX_SEL_DISP0,
++	MUX_SEL_DISP1,
++	MUX_SEL_DISP3,
++	DIV_DISP,
++	ENABLE_ACLK_DISP,
++	ENABLE_ACLK_DISP_RO_SMMU,
++	ENABLE_ACLK_DISP_RW_SMMU,
++	ENABLE_PCLK_DISP,
++	ENABLE_PCLK_DISP_RO_SMMU,
++	ENABLE_PCLK_DISP_RW_SMMU,
++	ENABLE_SCLK_DISP1,
++	ENABLE_SCLK_DISP2,
++};
++
++static const struct samsung_cmu_info disp_cmu_info __initconst = {
++	.pll_clks		= disp_pll_clks,
++	.nr_pll_clks		= ARRAY_SIZE(disp_pll_clks),
++	.mux_clks		= disp_mux_clks,
++	.nr_mux_clks		= ARRAY_SIZE(disp_mux_clks),
++	.div_clks		= disp_div_clks,
++	.nr_div_clks		= ARRAY_SIZE(disp_div_clks),
++	.gate_clks		= disp_gate_clks,
++	.nr_gate_clks		= ARRAY_SIZE(disp_gate_clks),
++	.nr_clk_ids		= DISP_NR_CLK,
++	.clk_regs		= disp_clk_regs,
++	.nr_clk_regs		= ARRAY_SIZE(disp_clk_regs),
++};
++
++static void __init exynos7_clk_disp_init(struct device_node *np)
++{
++	samsung_cmu_register_one(np, &disp_cmu_info);
++}
++
++CLK_OF_DECLARE(exynos7_clk_disp, "samsung,exynos7-clock-disp",
++		exynos7_clk_disp_init);
+--- a/include/dt-bindings/clock/exynos7-clk.h
++++ b/include/dt-bindings/clock/exynos7-clk.h
+@@ -48,7 +48,16 @@
+ #define CLK_SCLK_I2S1			14
+ #define CLK_ACLK_PERIC0_66		15
+ #define CLK_ACLK_PERIC1_66		16
+-#define TOP0_NR_CLK			17
++#define CLK_MOUT_ACLK_DISP_400		17
++#define CLK_DOUT_ACLK_DISP_400		18
++#define CLK_ACLK_DISP_400		19
++#define CLK_MOUT_SCLK_DECON_INT_ECLK	20
++#define CLK_DOUT_SCLK_DECON_INT_ECLK	21
++#define CLK_SCLK_DECON_INT_ECLK		22
++#define CLK_MOUT_SCLK_DECON_VCLK	23
++#define CLK_DOUT_SCLK_DECON_VCLK	24
++#define CLK_SCLK_DECON_VCLK		25
++#define TOP0_NR_CLK			26
+ 
+ /* TOP1 */
+ #define DOUT_ACLK_FSYS1_200		1
+@@ -125,7 +134,8 @@
+ #define PCLK_WDT			3
+ #define PCLK_TMU			4
+ #define SCLK_TMU			5
+-#define PERIS_NR_CLK			6
++#define PCLK_MCT			6
++#define PERIS_NR_CLK			7
+ 
+ /* FSYS0 */
+ #define ACLK_MMC2			1
+@@ -200,5 +210,35 @@
+ #define PCLK_I2S			3
+ #define PCLK_PCM			4
+ #define ACLK_ADMA			5
+-#define AUD_NR_CLK			6
++#define PCLK_UART			6
++#define SCLK_UART			7
++#define AUD_NR_CLK			8
++
++/* G3D */
++#define CLK_FOUT_G3D_PLL		1
++#define CLK_MOUT_ACLK_G3D_400		2
++#define CLK_DIV_ACLK_G3D		3
++#define CLK_DIV_PCLK_G3D		4
++#define CLK_ACLK_G3D			5
++#define CLK_PCLK_SYSREG_G3D		6
++#define CLK_PCLK_PMU_G3D		7
++#define G3D_NR_CLK			8
++
++/* DISP */
++#define CLK_FOUT_DISP_PLL			1
++#define CLK_MOUT_SUB_SCLK_DECON_INT_ECLK	2
++#define CLK_MOUT_SUB_SCLK_DECON_INT_VCLK	3
++#define CLK_DOUT_PCLK_DISP			4
++#define CLK_DOUT_SUB_SCLK_DECON_INT_ECLK	5
++#define CLK_DOUT_SUB_SCLK_DECON_INT_VCLK	6
++#define CLK_ACLK_DECON0				7
++#define CLK_PCLK_DECON0				8
++#define CLK_SCLK_DECON0_ECLK			9
++#define CLK_SCLK_DECON0_VCLK			10
++#define CLK_PCLK_DSIM0				11
++#define CLK_ACLK_DISP_RO_SYSMMU			12
++#define CLK_ACLK_DISP_RW_SYSMMU			13
++#define CLK_PCLK_DISP_RO_SYSMMU			14
++#define CLK_PCLK_DISP_RW_SYSMMU			15
++#define DISP_NR_CLK				16
+ #endif /* _DT_BINDINGS_CLOCK_EXYNOS7_H */
+--- a/arch/arm64/boot/dts/exynos/exynos7.dtsi
++++ b/arch/arm64/boot/dts/exynos/exynos7.dtsi
+@@ -25,18 +25,15 @@
+ 		pinctrl6 = &pinctrl_fsys0;
+ 		pinctrl7 = &pinctrl_fsys1;
+ 		pinctrl8 = &pinctrl_bus1;
++		pinctrl9 = &pinctrl_aud;
++		spi0 = &spi_0;
+ 		tmuctrl0 = &tmuctrl_0;
+ 	};
+ 
+-	arm-pmu {
+-		compatible = "arm,cortex-a57-pmu";
+-		interrupts = <GIC_SPI 56 IRQ_TYPE_LEVEL_HIGH>,
+-			     <GIC_SPI 57 IRQ_TYPE_LEVEL_HIGH>,
+-			     <GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH>,
+-			     <GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>;
+-		interrupt-affinity = <&cpu_atlas0>, <&cpu_atlas1>,
+-				     <&cpu_atlas2>, <&cpu_atlas3>;
+-	};
++	/*
++	 * Only the Cortex-A53 cluster is described for now; the A57 PMU
++	 * interrupts do not apply, so leave the PMU out.
++	 */
+ 
+ 	fin_pll: clock {
+ 		/* XXTI */
+@@ -49,17 +46,15 @@
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+ 
++		/*
++		 * Cortex-A57 (atlas) cluster.  Power-up is handled by
++		 * exynos7420_pmu_cpu_power_up() in psci.c.
++		 */
+ 		cpu_atlas0: cpu@0 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x0>;
+ 			enable-method = "psci";
+-			i-cache-size = <0xc000>;
+-			i-cache-line-size = <64>;
+-			i-cache-sets = <256>;
+-			d-cache-size = <0x8000>;
+-			d-cache-line-size = <64>;
+-			d-cache-sets = <256>;
+ 			next-level-cache = <&atlas_l2>;
+ 		};
+ 
+@@ -68,12 +63,6 @@
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x1>;
+ 			enable-method = "psci";
+-			i-cache-size = <0xc000>;
+-			i-cache-line-size = <64>;
+-			i-cache-sets = <256>;
+-			d-cache-size = <0x8000>;
+-			d-cache-line-size = <64>;
+-			d-cache-sets = <256>;
+ 			next-level-cache = <&atlas_l2>;
+ 		};
+ 
+@@ -82,12 +71,6 @@
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x2>;
+ 			enable-method = "psci";
+-			i-cache-size = <0xc000>;
+-			i-cache-line-size = <64>;
+-			i-cache-sets = <256>;
+-			d-cache-size = <0x8000>;
+-			d-cache-line-size = <64>;
+-			d-cache-sets = <256>;
+ 			next-level-cache = <&atlas_l2>;
+ 		};
+ 
+@@ -96,12 +79,6 @@
+ 			compatible = "arm,cortex-a57";
+ 			reg = <0x3>;
+ 			enable-method = "psci";
+-			i-cache-size = <0xc000>;
+-			i-cache-line-size = <64>;
+-			i-cache-sets = <256>;
+-			d-cache-size = <0x8000>;
+-			d-cache-line-size = <64>;
+-			d-cache-sets = <256>;
+ 			next-level-cache = <&atlas_l2>;
+ 		};
+ 
+@@ -113,6 +90,34 @@
+ 			cache-line-size = <64>;
+ 			cache-sets = <2048>;
+ 		};
++
++		cpu_apollo0: cpu@100 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a53";
++			reg = <0x100>;
++			enable-method = "psci";
++		};
++
++		cpu_apollo1: cpu@101 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a53";
++			reg = <0x101>;
++			enable-method = "psci";
++		};
++
++		cpu_apollo2: cpu@102 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a53";
++			reg = <0x102>;
++			enable-method = "psci";
++		};
++
++		cpu_apollo3: cpu@103 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a53";
++			reg = <0x103>;
++			enable-method = "psci";
++		};
+ 	};
+ 
+ 	psci {
+@@ -131,6 +136,26 @@
+ 		chipid@10000000 {
+ 			compatible = "samsung,exynos4210-chipid";
+ 			reg = <0x10000000 0x100>;
++		};
++
++		timer@101c0000 {
++			compatible = "samsung,exynos4210-mct";
++			reg = <0x101c0000 0x800>;
++			interrupts = <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 113 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 114 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 115 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 116 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 117 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 118 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 119 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 120 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 121 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 122 IRQ_TYPE_LEVEL_HIGH>,
++				<GIC_SPI 123 IRQ_TYPE_LEVEL_HIGH>;
++			samsung,local-timers = <0 1 2 3 4 5 6 7>;
++			clocks = <&fin_pll>, <&clock_peris PCLK_MCT>;
++			clock-names = "fin_pll", "mct";
+ 		};
+ 
+ 		gic: interrupt-controller@11001000 {
+@@ -319,6 +344,16 @@
+ 			status = "disabled";
+ 		};
+ 
++		serial_4: serial@11460000 {
++			compatible = "samsung,exynos4210-uart";
++			reg = <0x11460000 0x100>;
++			interrupts = <GIC_SPI 91 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_aud PCLK_UART>,
++				 <&cmu_aud SCLK_UART>;
++			clock-names = "uart", "clk_uart_baud0";
++			status = "disabled";
++		};
++
+ 		pinctrl_alive: pinctrl@10580000 {
+ 			compatible = "samsung,exynos7-pinctrl";
+ 			reg = <0x10580000 0x1000>;
+@@ -378,6 +413,12 @@
+ 			interrupts = <GIC_SPI 384 IRQ_TYPE_LEVEL_HIGH>;
+ 		};
+ 
++		pinctrl_aud: pinctrl@114b0000 {
++			compatible = "samsung,exynos7-pinctrl";
++			reg = <0x114b0000 0x1000>;
++			interrupts = <GIC_SPI 92 IRQ_TYPE_LEVEL_HIGH>;
++		};
++
+ 		hsi2c_0: i2c@13640000 {
+ 			compatible = "samsung,exynos7-hsi2c";
+ 			reg = <0x13640000 0x1000>;
+@@ -427,6 +468,22 @@
+ 			pinctrl-0 = <&hs_i2c3_bus>;
+ 			clocks = <&clock_peric1 PCLK_HSI2C3>;
+ 			clock-names = "hsi2c";
++			status = "disabled";
++		};
++
++		spi_0: spi@14d20000 {
++			compatible = "samsung,exynos7-spi";
++			reg = <0x14d20000 0x100>;
++			interrupts = <GIC_SPI 464 IRQ_TYPE_LEVEL_HIGH>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			samsung,spi-src-clk = <0>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&spi0_bus>;
++			clocks = <&clock_peric1 PCLK_SPI0>,
++				 <&clock_peric1 SCLK_SPI0>;
++			clock-names = "spi", "spi_busclk0";
++			num-cs = <1>;
+ 			status = "disabled";
+ 		};
+ 
+@@ -539,6 +596,21 @@
+ 			reg = <0x105c0000 0x5000>;
+ 		};
+ 
++		pd_g3d: power-domain@105c4060 {
++			compatible = "samsung,exynos5433-pd";
++			reg = <0x105c4060 0x20>;
++			#power-domain-cells = <0>;
++			label = "G3D";
++		};
++
++		pd_disp: power-domain@105c4080 {
++			compatible = "samsung,exynos7420-pd";
++			reg = <0x105c4080 0x20>;
++			#power-domain-cells = <0>;
++			label = "DISP";
++			status = "okay";
++		};
++
+ 		rtc: rtc@10590000 {
+ 			compatible = "samsung,s3c6410-rtc";
+ 			reg = <0x10590000 0x100>;
+@@ -556,9 +628,89 @@
+ 			clocks = <&clock_peris PCLK_WDT>;
+ 			clock-names = "watchdog";
+ 			samsung,syscon-phandle = <&pmu_system_controller>;
++			status = "disabled";
++		};
++
++		cmu_g3d: clock-controller@14aa0000 {
++			compatible = "samsung,exynos7-clock-g3d";
++			reg = <0x14aa0000 0x1000>;
++			#clock-cells = <1>;
++		};
++
++		cmu_aud: clock-controller@114c0000 {
++			compatible = "samsung,exynos7-clock-aud";
++			reg = <0x114c0000 0x1000>;
++			#clock-cells = <1>;
++		};
++
++		adma: dma-controller@11420000 {
++			compatible = "arm,pl330", "arm,primecell";
++			reg = <0x11420000 0x1000>;
++			interrupts = <GIC_SPI 97 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_aud ACLK_ADMA>;
++			clock-names = "apb_pclk";
++			#dma-cells = <1>;
++		};
++
++		i2s0: i2s@11440000 {
++			compatible = "samsung,exynos7-i2s";
++			reg = <0x11440000 0x100>;
++			dmas = <&adma 0>, <&adma 2>;
++			dma-names = "tx", "rx";
++			interrupts = <GIC_SPI 70 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_aud PCLK_I2S>,
++				 <&cmu_aud SCLK_I2S>,
++				 <&cmu_aud SCLK_I2S>;
++			clock-names = "iis", "i2s_opclk0", "i2s_opclk1";
++			#clock-cells = <1>;
++			#sound-dai-cells = <1>;
+ 			status = "disabled";
+ 		};
+ 
++		cmu_disp: clock-controller@13ad0000 {
++			compatible = "samsung,exynos7-clock-disp";
++			reg = <0x13ad0000 0x1000>;
++			#clock-cells = <1>;
++		};
++
++		sysmmu_disp_ro: sysmmu@13a00000 {
++			compatible = "samsung,exynos-sysmmu";
++			reg = <0x13a00000 0x1000>;
++			interrupts = <GIC_SPI 176 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_disp CLK_ACLK_DISP_RO_SYSMMU>,
++				 <&cmu_disp CLK_PCLK_DISP_RO_SYSMMU>,
++				 <&cmu_disp CLK_ACLK_DECON0>;
++			clock-names = "aclk", "pclk", "master";
++			#iommu-cells = <0>;
++		};
++
++		sysmmu_disp_rw: sysmmu@13a10000 {
++			compatible = "samsung,exynos-sysmmu";
++			reg = <0x13a10000 0x1000>;
++			interrupts = <GIC_SPI 179 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&cmu_disp CLK_ACLK_DISP_RW_SYSMMU>,
++				 <&cmu_disp CLK_PCLK_DISP_RW_SYSMMU>,
++				 <&cmu_disp CLK_ACLK_DECON0>;
++			clock-names = "aclk", "pclk", "master";
++			#iommu-cells = <0>;
++		};
++
++		decon: decon@13930000 {
++			compatible = "samsung,exynos7-decon";
++			reg = <0x13930000 0x10000>;
++			clocks = <&cmu_disp CLK_PCLK_DECON0>,
++				 <&cmu_disp CLK_ACLK_DECON0>,
++				 <&cmu_disp CLK_SCLK_DECON0_ECLK>,
++				 <&cmu_disp CLK_SCLK_DECON0_VCLK>;
++			clock-names = "pclk_decon0", "aclk_decon0",
++				      "decon0_eclk", "decon0_vclk";
++			iommus = <&sysmmu_disp_ro>, <&sysmmu_disp_rw>;
++			interrupts = <GIC_SPI 190 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 188 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "vsync", "lcd_sys";
++			status = "disabled";
++		};
++
+ 		gpu: gpu@14ac0000 {
+ 			compatible = "samsung,exynos5433-mali", "arm,mali-t760";
+ 			reg = <0x14ac0000 0x5000>;
+@@ -566,8 +718,11 @@
+ 				     <GIC_SPI 242 IRQ_TYPE_LEVEL_HIGH>,
+ 				     <GIC_SPI 240 IRQ_TYPE_LEVEL_HIGH>;
+ 			interrupt-names = "job", "mmu", "gpu";
++			clocks = <&cmu_g3d CLK_ACLK_G3D>,
++				 <&cmu_g3d CLK_PCLK_SYSREG_G3D>;
++			clock-names = "core", "bus";
++			power-domains = <&pd_g3d>;
+ 			status = "disabled";
+-			/* TODO: operating points for DVFS, cooling device */
+ 		};
+ 
+ 		mmc_0: mmc@15740000 {
+@@ -722,12 +877,11 @@
+ 
+ 	timer {
+ 		compatible = "arm,armv8-timer";
++		interrupt-names = "sec-phys", "phys", "hyp-phys";
+ 		interrupts = <GIC_PPI 13
+ 				(GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+ 			     <GIC_PPI 14
+ 				(GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+-			     <GIC_PPI 11
+-				(GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>,
+ 			     <GIC_PPI 10
+ 				(GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW)>;
+ 	};
+--- a/drivers/pmdomain/samsung/exynos-pm-domains.c
++++ b/drivers/pmdomain/samsung/exynos-pm-domains.c
+@@ -19,9 +19,32 @@
+ #include <linux/of_address.h>
+ #include <linux/pm_runtime.h>
+ 
++enum exynos_pd_block {
++	PD_BLK_TOP0,
++	PD_BLK_DISP,
++	PD_BLK_VPP,
++	PD_BLK_PMU,
++	PD_NUM_BLKS,
++};
++
++/* RMW descriptor for the Exynos7420 power-up/down register sequences */
++struct exynos_pd_seq {
++	u8 blk;
++	u16 off;
++	u32 set;
++	u32 clr;
++};
++
+ struct exynos_pm_domain_config {
+ 	/* Value for LOCAL_PWR_CFG and STATUS fields for each domain */
+ 	u32 local_pwr_cfg;
++	/* Value written to the OPTION register (base + 0x8); 0 = skip */
++	u32 local_pwr_option;
++	/* Optional pre/post power sequences (Exynos7420 DISP) */
++	const struct exynos_pd_seq *pre;
++	unsigned int n_pre;
++	const struct exynos_pd_seq *post;
++	unsigned int n_post;
+ };
+ 
+ /*
+@@ -31,8 +54,43 @@
+ 	void __iomem *base;
+ 	struct generic_pm_domain pd;
+ 	u32 local_pwr_cfg;
++	u32 local_pwr_option;
++	void __iomem *blk[PD_NUM_BLKS];
++	const struct exynos_pd_seq *pre;
++	unsigned int n_pre;
++	const struct exynos_pd_seq *post;
++	unsigned int n_post;
+ };
+ 
++static const resource_size_t exynos7420_pd_blk_addr[PD_NUM_BLKS] = {
++	[PD_BLK_TOP0] = 0x105d0000,
++	[PD_BLK_DISP] = 0x13ad0000,
++	[PD_BLK_VPP] = 0x13ed0000,
++	[PD_BLK_PMU] = 0x105c0000,
++};
++
++static void exynos_pd_apply_seq(struct exynos_pm_domain *pd,
++				const struct exynos_pd_seq *seq,
++				unsigned int n, bool power_on)
++{
++	unsigned int i;
++
++	for (i = 0; i < n; i++, seq++) {
++		void __iomem *base = pd->blk[seq->blk];
++		u32 set = power_on ? seq->set : seq->clr;
++		u32 clr = power_on ? seq->clr : seq->set;
++		u32 v;
++
++		if (!base)
++			continue;
++
++		v = readl_relaxed(base + seq->off);
++		v |= set;
++		v &= ~clr;
++		writel_relaxed(v, base + seq->off);
++	}
++}
++
+ static int exynos_pd_power(struct generic_pm_domain *domain, bool power_on)
+ {
+ 	struct exynos_pm_domain *pd;
+@@ -44,6 +102,14 @@
+ 	base = pd->base;
+ 
+ 	pwr = power_on ? pd->local_pwr_cfg : 0;
++
++	/* Exynos7420: bring up top/async clocks + PMU sys_pwr before power */
++	if (power_on)
++		exynos_pd_apply_seq(pd, pd->pre, pd->n_pre, true);
++
++	if (power_on && pd->local_pwr_option)
++		writel_relaxed(pd->local_pwr_option, base + 0x8);
++
+ 	writel_relaxed(pwr, base);
+ 
+ 	/* Wait max 1ms */
+@@ -60,6 +126,9 @@
+ 		usleep_range(80, 100);
+ 	}
+ 
++	if (power_on)
++		exynos_pd_apply_seq(pd, pd->post, pd->n_post, true);
++
+ 	return 0;
+ }
+ 
+@@ -81,6 +150,38 @@
+ 	.local_pwr_cfg		= 0xf,
+ };
+ 
++/*
++ * Exynos7420 DISP power sequence, ported from the vendor kernel
++ * (arch/arm/mach-exynos/pm_domains-exynos7420.c + -cal.h). The generic
++ * sequence is not enough on this SoC: top-to-local clocks, async-bridge
++ * clocks and the PMU sys_pwr registers must be programmed around the local
++ * power switch, and the OPTION register has to be written.
++ */
++static const struct exynos_pd_seq exynos7420_disp_pre[] = {
++	{ PD_BLK_TOP0, 0x080c, BIT(28), 0 },
++	{ PD_BLK_TOP0, 0x0a20, BIT(28) | BIT(24) | BIT(20) | BIT(16) | BIT(12), 0 },
++	{ PD_BLK_VPP, 0x0800, 0xf, 0 },
++	{ PD_BLK_PMU, 0x1450, 0, BIT(0) },
++	{ PD_BLK_PMU, 0x1490, 0, BIT(0) },
++	{ PD_BLK_PMU, 0x14d0, 0, BIT(0) },
++	{ PD_BLK_PMU, 0x1510, 0, BIT(0) },
++	{ PD_BLK_PMU, 0x1550, 0, BIT(9) | BIT(8) | BIT(5) | BIT(4) | BIT(1) | BIT(0) },
++	{ PD_BLK_PMU, 0x1590, 0, BIT(0) },
++};
++
++static const struct exynos_pd_seq exynos7420_disp_post[] = {
++	{ PD_BLK_DISP, 0x0800, BIT(31) | BIT(30) | BIT(29) | BIT(28), 0 },
++};
++
++static const struct exynos_pm_domain_config exynos7420_disp_cfg = {
++	.local_pwr_cfg		= 0xf,
++	.local_pwr_option	= 0x0102,
++	.pre			= exynos7420_disp_pre,
++	.n_pre			= ARRAY_SIZE(exynos7420_disp_pre),
++	.post			= exynos7420_disp_post,
++	.n_post			= ARRAY_SIZE(exynos7420_disp_post),
++};
++
+ static const struct of_device_id exynos_pm_domain_of_match[] = {
+ 	{
+ 		.compatible = "samsung,exynos4210-pd",
+@@ -88,6 +189,9 @@
+ 	}, {
+ 		.compatible = "samsung,exynos5433-pd",
+ 		.data = &exynos5433_cfg,
++	}, {
++		.compatible = "samsung,exynos7420-pd",
++		.data = &exynos7420_disp_cfg,
+ 	},
+ 	{ },
+ };
+@@ -128,7 +232,25 @@
+ 	pd->pd.power_off = exynos_pd_power_off;
+ 	pd->pd.power_on = exynos_pd_power_on;
+ 	pd->local_pwr_cfg = pm_domain_cfg->local_pwr_cfg;
++	pd->local_pwr_option = pm_domain_cfg->local_pwr_option;
++	pd->pre = pm_domain_cfg->pre;
++	pd->n_pre = pm_domain_cfg->n_pre;
++	pd->post = pm_domain_cfg->post;
++	pd->n_post = pm_domain_cfg->n_post;
+ 
++	/* Exynos7420: map the clock/PMU register windows used by the seqs */
++	if (pd->n_pre || pd->n_post) {
++		int i;
++
++		for (i = 0; i < PD_NUM_BLKS; i++) {
++			pd->blk[i] = devm_ioremap(dev,
++						  exynos7420_pd_blk_addr[i],
++						  0x1000);
++			if (!pd->blk[i])
++				dev_warn(dev, "failed to map block %d\n", i);
++		}
++	}
++
+ 	on = readl_relaxed(pd->base + 0x4) & pd->local_pwr_cfg;
+ 
+ 	pm_genpd_init(&pd->pd, NULL, !on);
+--- a/drivers/gpu/drm/exynos/exynos_drm_dma.c
++++ b/drivers/gpu/drm/exynos/exynos_drm_dma.c
+@@ -6,6 +6,7 @@
+ 
+ #include <linux/dma-map-ops.h>
+ #include <linux/iommu.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+ 
+ #include <drm/drm_print.h>
+@@ -112,9 +113,22 @@
+ 		if (IS_ENABLED(CONFIG_ARM_DMA_USE_IOMMU))
+ 			mapping = arm_iommu_create_mapping(&platform_bus_type,
+ 				EXYNOS_DEV_ADDR_START, EXYNOS_DEV_ADDR_SIZE);
+-		else if (IS_ENABLED(CONFIG_IOMMU_DMA))
++		else if (IS_ENABLED(CONFIG_IOMMU_DMA)) {
+ 			mapping = iommu_get_domain_for_dev(priv->dma_dev);
+-		else
++
++			/*
++			 * The device is wired to a SYSMMU in DT but the IOMMU
++			 * provider has not attached a domain yet. Returning 0
++			 * here would permanently cache an IOMMU-less mapping
++			 * and the DECON would keep rejecting non-contiguous
++			 * dma-bufs, so defer until the IOMMU is really up.
++			 */
++			if (!mapping &&
++			    (of_property_present(dev->of_node, "iommus") ||
++			     of_property_present(priv->dma_dev->of_node,
++						 "iommus")))
++				return -EPROBE_DEFER;
++		} else
+ 			mapping = ERR_PTR(-ENODEV);
+ 
+ 		if (IS_ERR(mapping))
+--- a/drivers/gpu/drm/exynos/exynos_drm_drv.c
++++ b/drivers/gpu/drm/exynos/exynos_drm_drv.c
+@@ -15,6 +15,7 @@
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
++#include <drm/drm_aperture.h>
+ #include <drm/drm_drv.h>
+ #include <drm/drm_file.h>
+ #include <drm/drm_fourcc.h>
+@@ -241,6 +242,16 @@
+ 	unsigned int clone_mask;
+ 	int ret;
+ 
++	/*
++	 * Remove the bootloader's simple-framebuffer (simpledrm) before taking
++	 * over.  Otherwise userspace ends up with two DRM devices/connectors
++	 * (simpledrm + exynos) driving the same panel, which confuses touch
++	 * input mapping and per-monitor scaling.
++	 */
++	ret = drm_aperture_remove_framebuffers(&exynos_drm_driver);
++	if (ret)
++		return ret;
++
+ 	drm = drm_dev_alloc(&exynos_drm_driver, dev);
+ 	if (IS_ERR(drm))
+ 		return PTR_ERR(drm);
+--- a/drivers/gpu/drm/exynos/exynos_drm_drv.h
++++ b/drivers/gpu/drm/exynos/exynos_drm_drv.h
+@@ -227,6 +227,19 @@
+ 			       void **dma_priv);
+ void exynos_drm_cleanup_dma(struct drm_device *drm);
+ 
++#if IS_ENABLED(CONFIG_EXYNOS_IOMMU)
++void exynos_iommu_master_ready(struct device *master);
++int exynos_iommu_map_identity(struct device *master, phys_addr_t phys,
++			      size_t size);
++#else
++static inline void exynos_iommu_master_ready(struct device *master) { }
++static inline int exynos_iommu_map_identity(struct device *master,
++					    phys_addr_t phys, size_t size)
++{
++	return -ENODEV;
++}
++#endif
++
+ #ifdef CONFIG_DRM_EXYNOS_DPI
+ struct drm_encoder *exynos_dpi_probe(struct device *dev);
+ int exynos_dpi_remove(struct drm_encoder *encoder);
+--- a/drivers/gpu/drm/exynos/exynos7_drm_decon.c
++++ b/drivers/gpu/drm/exynos/exynos7_drm_decon.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/clk.h>
+ #include <linux/component.h>
++#include <linux/delay.h>
+ #include <linux/kernel.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+@@ -81,10 +82,8 @@
+ 	DRM_PLANE_TYPE_CURSOR,
+ };
+ 
+-static void decon_wait_for_vblank(struct exynos_drm_crtc *crtc)
++static void decon_wait_for_vblank(struct decon_context *ctx)
+ {
+-	struct decon_context *ctx = crtc->ctx;
+-
+ 	if (ctx->suspended)
+ 		return;
+ 
+@@ -100,9 +99,8 @@
+ 		DRM_DEV_DEBUG_KMS(ctx->dev, "vblank wait timed out.\n");
+ }
+ 
+-static void decon_clear_channels(struct exynos_drm_crtc *crtc)
++static void decon_clear_channels(struct decon_context *ctx)
+ {
+-	struct decon_context *ctx = crtc->ctx;
+ 	unsigned int win, ch_enabled = 0;
+ 
+ 	/* Check if any channel is enabled. */
+@@ -118,7 +116,7 @@
+ 
+ 	/* Wait for vsync, as disable channel takes effect at next vsync */
+ 	if (ch_enabled)
+-		decon_wait_for_vblank(ctx->crtc);
++		decon_wait_for_vblank(ctx);
+ }
+ 
+ static int decon_ctx_initialize(struct decon_context *ctx,
+@@ -126,7 +124,7 @@
+ {
+ 	ctx->drm_dev = drm_dev;
+ 
+-	decon_clear_channels(ctx->crtc);
++	decon_clear_channels(ctx);
+ 
+ 	return exynos_drm_register_dma(drm_dev, ctx->dev, &ctx->dma_priv);
+ }
+@@ -199,7 +197,8 @@
+ 	 * fields of register with prefix '_F' would be updated
+ 	 * at vsync(same as dma start)
+ 	 */
+-	val = VIDCON0_ENVID | VIDCON0_ENVID_F;
++	val = readl(ctx->regs + VIDCON0);
++	val |= VIDCON0_ENVID | VIDCON0_ENVID_F;
+ 	writel(val, ctx->regs + VIDCON0);
+ 
+ 	clkdiv = decon_calc_clkdiv(ctx, mode);
+@@ -227,7 +226,9 @@
+ 
+ 		val |= VIDINTCON0_INT_ENABLE;
+ 
+-		if (!ctx->i80_if) {
++		if (ctx->i80_if) {
++			val |= VIDINTCON0_INT_I80_EN;
++		} else {
+ 			val |= VIDINTCON0_INT_FRAME;
+ 			val &= ~VIDINTCON0_FRAMESEL0_MASK;
+ 			val |= VIDINTCON0_FRAMESEL0_VSYNC;
+@@ -251,7 +252,9 @@
+ 		val = readl(ctx->regs + VIDINTCON0);
+ 
+ 		val &= ~VIDINTCON0_INT_ENABLE;
+-		if (!ctx->i80_if)
++		if (ctx->i80_if)
++			val &= ~VIDINTCON0_INT_I80_EN;
++		else
+ 			val &= ~VIDINTCON0_INT_FRAME;
+ 
+ 		writel(val, ctx->regs + VIDINTCON0);
+@@ -408,6 +411,14 @@
+ 	/* buffer start address */
+ 	val = (unsigned long)exynos_drm_fb_dma_addr(fb, 0);
+ 	writel(val, ctx->regs + VIDW_BUF_START(win));
++	/*
++	 * The window runs in triple buffer mode; program all three buffer
++	 * start registers with the same address.  Only writing ADD0 made the
++	 * hardware rotate through stale ADD1/ADD2 addresses, which showed up
++	 * as flickering content on every repaint.
++	 */
++	writel(val, ctx->regs + VIDW_BUF_START1(win));
++	writel(val, ctx->regs + VIDW_BUF_START2(win));
+ 
+ 	padding = (pitch / cpp) - fb->width;
+ 
+@@ -508,6 +519,29 @@
+ 
+ 	for (i = 0; i < WINDOWS_NR; i++)
+ 		decon_shadow_protect_win(ctx, i, false);
++
++	/*
++	 * Command mode has no vsync: kick off one frame transmission now.
++	 * The trigger sequence mirrors what the bootloader/simpledrm uses to
++	 * push a frame to the command-mode panel.  The resulting frame-done
++	 * interrupt feeds vblank and completes the pending atomic commit.
++	 */
++	if (ctx->i80_if) {
++		u32 val = readl(ctx->regs + TRIGCON);
++
++		val &= ~(TRIGCON_HWTRIG_INV_I80_RGB | TRIGCON_HWTRIGEN_I80_RGB |
++			 TRIGCON_HWTRIGMASK_DISPIF0 |
++			 TRIGCON_HWTRIGMASK_DISPIF1);
++		val |= TRIGCON_SWTRIGEN_I80_RGB | TRIGCON_SWTRIGCMD_I80_RGB |
++		       TRIGCON_HWTRIGEN_I80_RGB | TRIGCON_HWTRIGMASK_DISPIF0 |
++		       TRIGCON_HWTRIGMASK_DISPIF1 | TRIGCON_HWTRIG_AUTO_MASK;
++		writel(val, ctx->regs + TRIGCON);
++		writel(readl(ctx->regs + DECON_UPDATE) |
++		       DECON_UPDATE_STANDALONE_F, ctx->regs + DECON_UPDATE);
++		writel(readl(ctx->regs + TRIGCON) | TRIGCON_SWTRIGCMD_I80_RGB,
++		       ctx->regs + TRIGCON);
++	}
++
+ 	exynos_crtc_handle_event(crtc);
+ }
+ 
+@@ -515,17 +549,24 @@
+ {
+ 	u32 val;
+ 
++	/*
++	 * In command (i80) mode the bootloader already brought up the whole
++	 * display path (DSI, panel, DECON trigger).  Resetting DECON here drops
++	 * state we cannot restore yet, after which no frame is ever transmitted.
++	 * Keep the existing configuration and just update the frame buffer.
++	 */
++	if (ctx->i80_if)
++		return;
++
+ 	writel(VIDCON0_SWRESET, ctx->regs + VIDCON0);
+ 
+ 	val = VIDOUTCON0_DISP_IF_0_ON;
+-	if (!ctx->i80_if)
+-		val |= VIDOUTCON0_RGBIF;
++	val |= VIDOUTCON0_RGBIF;
+ 	writel(val, ctx->regs + VIDOUTCON0);
+ 
+ 	writel(VCLKCON0_CLKVALUP | VCLKCON0_VCLKFREE, ctx->regs + VCLKCON0);
+ 
+-	if (!ctx->i80_if)
+-		writel(VIDCON1_VCLK_HOLD, ctx->regs + VIDCON1(0));
++	writel(VIDCON1_VCLK_HOLD, ctx->regs + VIDCON1(0));
+ }
+ 
+ static void decon_atomic_enable(struct exynos_drm_crtc *crtc)
+@@ -542,6 +583,29 @@
+ 		return;
+ 	}
+ 
++	if (ctx->i80_if) {
++		phys_addr_t fb = 0;
++		int i;
++
++		/*
++		 * The bootloader's framebuffer is still being scanned by DECON
++		 * and is not mapped in the IOMMU domain.  Map it one-to-one
++		 * (same idea as the vendor's iovmm_map_oto()) so the SYSMMU can
++		 * be brought up without DECON faulting on it.  The first commit
++		 * then switches the window to the IOVA-mapped framebuffer.
++		 */
++		for (i = 0; i < WINDOWS_NR; i++) {
++			phys_addr_t addr = readl(ctx->regs + VIDW_BUF_START(i));
++
++			if (addr && (!fb || addr < fb))
++				fb = addr;
++		}
++		if (fb)
++			exynos_iommu_map_identity(ctx->dev, fb, SZ_64M);
++	}
++
++	exynos_iommu_master_ready(ctx->dev);
++
+ 	decon_init(ctx);
+ 
+ 	/* if vblank was enabled status, enable it again. */
+@@ -601,14 +665,17 @@
+ 	if (!ctx->drm_dev)
+ 		goto out;
+ 
+-	if (!ctx->i80_if) {
+-		drm_crtc_handle_vblank(&ctx->crtc->base);
++	/*
++	 * In command (i80) mode the frame-done interrupt plays the role of
++	 * the vsync interrupt, so it must feed vblank as well, otherwise the
++	 * DRM atomic commit never completes.
++	 */
++	drm_crtc_handle_vblank(&ctx->crtc->base);
+ 
+-		/* set wait vsync event to zero and wake up queue. */
+-		if (atomic_read(&ctx->wait_vsync_event)) {
+-			atomic_set(&ctx->wait_vsync_event, 0);
+-			wake_up(&ctx->wait_vsync_queue);
+-		}
++	/* set wait vsync event to zero and wake up queue. */
++	if (atomic_read(&ctx->wait_vsync_event)) {
++		atomic_set(&ctx->wait_vsync_event, 0);
++		wake_up(&ctx->wait_vsync_queue);
+ 	}
+ out:
+ 	return IRQ_HANDLED;

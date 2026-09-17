@@ -1,0 +1,15 @@
+if [ "$(tty)" = "/dev/tty1" ] && [ -z "$WAYLAND_DISPLAY" ]; then
+  export XDG_SESSION_TYPE=wayland
+  export XDG_CURRENT_DESKTOP=GNOME
+  export XDG_SESSION_DESKTOP=gnome
+  # Display IOMMU/SYSMMU works and Mutter is GPU-composited.  Panfrost on
+  # Mali-T760 r0p1 is still unstable for GPU-rendered GTK4/WebKit surfaces
+  # (fragment job hangs -> flicker, tile ghosting), so software-render those
+  # toolkits while keeping the compositor on the GPU.
+  export WEBKIT_DISABLE_DMABUF_RENDERER=1
+  export WEBKIT_DISABLE_COMPOSITING_MODE=1
+  export GSK_RENDERER=cairo
+  # Compositor-side Panfrost workarounds.
+  export PAN_MESA_DEBUG=noafbc,nocrc
+  exec dbus-run-session -- bash -c '/usr/local/bin/sessionmanager-shim & (sleep 10; exec /usr/libexec/gsd-power) & (sleep 12; exec /usr/libexec/gsd-rfkill) & exec gnome-shell --wayland --display-server --no-x11' > /root/gnome.log 2>&1
+fi

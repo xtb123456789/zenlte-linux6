@@ -1,0 +1,11 @@
+[Unit]
+Description=Exynos7420 keep GPU powered (work around panfrost runtime-PM job timeouts)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'echo on > /sys/bus/platform/devices/14ac0000.gpu/power/control'
+
+[Install]
+WantedBy=multi-user.target
