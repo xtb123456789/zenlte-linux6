@@ -1,114 +1,134 @@
-# zenlte-linux6 — Samsung Galaxy S6 Edge+ (SM-G9280) mainline Linux 6.6
+# zenlte-linux6 — Samsung Galaxy S6 Edge+ (SM-G9280) on mainline Linux 6.6
 
-在 **Samsung Galaxy S6 Edge+ (SM-G9280, 代号 zenlte, Exynos7420)** 上跑 mainline Linux 6.6 +
-Ubuntu 24.04 (arm64) + GNOME 46 的移植工作，重点记录 **显示 IOMMU/SYSMMU**、
-**GPU (Panfrost/Mali-T760) 硬件加速** 和 **触摸交互** 的攻坚过程。
+Running mainline Linux 6.6 + Ubuntu 24.04 (arm64) + GNOME 46 on a
+**Samsung Galaxy S6 Edge+ (SM-G9280, codename zenlte, Exynos7420)**.
+This repo focuses on the **display IOMMU/SYSMMU**, **GPU (Panfrost / Mali-T760)
+hardware acceleration** and **touch input** work.
 
-> 主线内核本身不支持这台机器，本仓库包含了使其可用所需的全部内核改动、
-> 打包工具、可刷写镜像和完整的技术文档。
+> Mainline does not support this device out of the box.  This repository
+> contains all the kernel changes, packaging tools, flashable images and
+> technical documentation needed to make it usable.
 
-![SM-G9280 运行 Ubuntu 24.04.5 LTS / GNOME 46 / Wayland / Linux 6.6.0 / Mali-T760 (Panfrost)](docs/screenshots/ubuntu-24.04-gnome46-mali-t760.jpg)
+![SM-G9280 running Ubuntu 24.04.5 LTS / GNOME 46 / Wayland / Linux 6.6.0 / Mali-T760 (Panfrost)](docs/screenshots/ubuntu-24.04-gnome46-mali-t760.jpg)
 
-*SM-G9280 (Exynos7420) 运行 Ubuntu 24.04.5 LTS + GNOME 46 (Wayland) + Linux 6.6.0，
-显卡识别为 Mali-T760 (Panfrost)，8 核 (4×Cortex-A53 + 4×Cortex-A57)。*
+*SM-G9280 (Exynos7420) running Ubuntu 24.04.5 LTS + GNOME 46 (Wayland) +
+Linux 6.6.0; the GPU is detected as Mali-T760 (Panfrost); 8 cores
+(4× Cortex-A53 + 4× Cortex-A57).*
 
 ---
 
-## 里程碑（已实现）
+## Milestones (achieved)
 
-| 功能 | 状态 | 说明 |
+| Feature | Status | Notes |
 |---|---|---|
-| 启动 (Exynos7420, 8×CPU) | ✅ | mainline 6.6.0 + Ubuntu 24.04 arm64 |
-| WiFi (BCM4359 PCIe) | ✅ | `exynos7420-pcie` + brcmfmac |
-| 蓝牙 (BCM4349B1) | ✅ | UART4/LPASS + AUD pad retention |
-| 触摸 (stmfts) | ✅ | 点击 / 手势 / 2x 缩放 |
-| **显示 IOMMU/SYSMMU** | ✅ | DECON `13930000.decon` → SYSMMU `13a00000`/`13a10000` |
-| **GPU 硬件加速 (Panfrost)** | ✅ | Mali-T760，Mutter GPU 合成 + `glmark2` 900+ FPS |
-| GNOME 桌面 | ✅ | Wayland，`gnome-shell --display-server` |
-| 浏览器 / 桌面应用 | ✅ | 见「已知限制」 |
-| 音频 | ⚠️ | 见 `docs/HANDOVER-audio.md` |
+| Boot (Exynos7420, 8 CPUs) | ✅ | mainline 6.6.0 + Ubuntu 24.04 arm64 |
+| Wi-Fi (BCM4359 PCIe) | ✅ | `exynos7420-pcie` + brcmfmac |
+| Bluetooth (BCM4349B1) | ✅ | UART4/LPASS + AUD pad retention |
+| Touch (stmfts) | ✅ | taps / gestures / 2x scaling |
+| **Display IOMMU/SYSMMU** | ✅ | DECON `13930000.decon` → SYSMMU `13a00000`/`13a10000` |
+| **GPU acceleration (Panfrost)** | ✅ | Mali-T760, Mutter GPU-composited, `glmark2` 900+ FPS |
+| GNOME desktop | ✅ | Wayland, `gnome-shell --display-server` |
+| Browser / desktop apps | ✅ | see "Known limitations" |
+| Audio | ⚠️ | see `docs/HANDOVER-audio.md` |
 
-## 关键突破
+## Key breakthroughs
 
-### 1. 显示 IOMMU/SYSMMU（`patches/` 里的 `exynos-iommu.c`、`exynos7.dtsi`）
-Exynos7420 的 DECON 走 SYSMMU v6。mainline 驱动无法直接工作，修复点：
+### 1. Display IOMMU/SYSMMU (`exynos-iommu.c`, `exynos7.dtsi` in `patches/`)
+The Exynos7420 DECON is wired to SYSMMU v6.  The mainline driver cannot work
+as-is; the fixes are:
 
-- **probe 不读版本寄存器**（DISP 域未上电时读会挂总线）→ 静态 `MAKE_MMU_VER(6,0)` + `sysmmu_v5_variant`
-- **`owner->ready` 延迟使能**：DECON runtime-resume 时不使能 SYSMMU，等 DECON 驱动确认
-  已编程 IOVA framebuffer 后再调 `exynos_iommu_master_ready()`
-- **恒等映射 bootloader framebuffer**（原厂 `iovmm_map_oto` 语义）：`exynos_iommu_map_identity()`，
-  让 SYSMMU 一开始翻译时 DECON 读旧物理地址也正确
-- **SYSMMU 挂 `master` 时钟**（= DECON aclk），否则 CCF 使能 pclk 时挂总线
-- **SYSMMU fault 非致命**（对齐原厂 `disp_driver_fault_handler`）
-- **DECON 驱动移除冲突的 simpledrm**（`drm_aperture_remove_framebuffers()`），
-  否则 GNOME 看到两个显示设备 → 触摸映射/缩放错乱
+- **Do not read the version register at probe** (it wedges the bus while the
+  DISP power domain is off) → static `MAKE_MMU_VER(6,0)` + `sysmmu_v5_variant`.
+- **Deferred enable via `owner->ready`**: do not enable the SYSMMU on the
+  DECON runtime-resume path; wait until the DECON driver has programmed an
+  IOVA-mapped framebuffer, then call `exynos_iommu_master_ready()`.
+- **Identity-map the bootloader framebuffer** (vendor `iovmm_map_oto`
+  semantics) via `exynos_iommu_map_identity()`, so the DECON can keep scanning
+  its old physical framebuffer once the SYSMMU starts translating.
+- **Wire the SYSMMU `master` clock** (= DECON aclk); otherwise the CCF hangs
+  when enabling the SYSMMU `pclk`.
+- **Make SYSMMU faults non-fatal** (match the vendor `disp_driver_fault_handler`).
+- **Remove the conflicting simpledrm** in the DECON driver
+  (`drm_aperture_remove_framebuffers()`); otherwise GNOME sees two display
+  devices and touch mapping / scaling break.
 
-### 2. DECON 三缓冲（`exynos7_drm_decon.c`）
-驱动设了 `WINCONx_TRIPLE_BUF_MODE` 却只写 `VIDW_BUF_START`(0x80)，
-未写 `BUF_START1/2`(0x84/0x88) → 每次重绘显示旧帧（闪烁）。补写同一地址即可。
+### 2. DECON triple buffering (`exynos7_drm_decon.c`)
+The driver sets `WINCONx_TRIPLE_BUF_MODE` but only writes `VIDW_BUF_START`
+(0x80), not `BUF_START1/2` (0x84/0x88) → stale frames on every repaint
+(flicker).  Writing the same address to all three fixes it.
 
-### 3. GPU（`clk-exynos7.c`、`exynos7.dtsi`、Mesa）
-Mali-T760 r0p1 在 mainline 下会 `gpu sched timeout` / `js fault`（fragment job 卡死、tile 重影）：
+### 3. GPU (`clk-exynos7.c`, `exynos7.dtsi`, Mesa)
+Mali-T760 r0p1 on mainline hits `gpu sched timeout` / `js fault`
+(fragment jobs hang, tile ghosting):
 
-- **GPU `bus` 时钟**：给 `gpu@14ac0000` 加 `clock-names = "core","bus"`，
-  `bus` = `CLK_PCLK_SYSREG_G3D`（原厂会开，mainline 从未开）
-- **GPU async-bridge 时钟**：补 `aclk_lh_g3d0/1`（CMU_CCORE `ENABLE_ACLK_CCORE0` bit22/23，
-  `CLK_IS_CRITICAL`）
-- **Mesa 侧**：`PAN_MESA_DEBUG=noafbc,nocrc`（禁用 AFBC 与事务消除/CRC）
-- 合成器（Mutter）走 GPU；GTK4/WebKit 应用当前用 `GSK_RENDERER=cairo` 软件渲染以保证无重影
+- **GPU `bus` clock**: add `clock-names = "core","bus"` to `gpu@14ac0000`
+  where `bus = CLK_PCLK_SYSREG_G3D` (the vendor enables it; mainline never did).
+- **GPU async-bridge clocks**: add `aclk_lh_g3d0/1` (CMU_CCORE
+  `ENABLE_ACLK_CCORE0` bits 22/23, `CLK_IS_CRITICAL`).
+- **Mesa side**: `PAN_MESA_DEBUG=noafbc,nocrc` (disable AFBC and
+  transaction-elimination/CRC).
+- The compositor (Mutter) uses the GPU; GTK4/WebKit apps currently use
+  `GSK_RENDERER=cairo` (software) to guarantee artifact-free rendering.
 
-### 4. 其它
-- 触摸：关闭 `scale-monitor-framebuffer` 实验特性（2x 缩放下触摸映射错乱）
-- `pd_disp` 是雷：mainline genpd 缺原厂 TZPC SMC，不能挂 `power-domains`
-- DT 必须打包成 **DTBH 容器**（`tools/mkdtbh.py`）
+### 4. Misc
+- Touch: disable the `scale-monitor-framebuffer` experimental feature
+  (touch mapping breaks at 2x scale).
+- `pd_disp` is a landmine: the mainline genpd lacks the vendor TZPC SMC, so do
+  not attach `power-domains`.
+- The DT must be packed as a **DTBH container** (`tools/mkdtbh.py`).
 
-## 仓库结构
+## Repository layout
 
 ```
-patches/    内核改动 patch（相对 v6.6）+ 设备 defconfig
-artifacts/  可刷写镜像（boot_bt_iommu*.img）与内核模块（.ko）
-tools/      mkbootimg/mkdtbh（打包）、acm.py/send_b64.py（串口）
-docs/       交接文档、进度记录、技术分析
-rootfs/     设备侧配置（.bash_profile、monitors.xml 等）
+patches/    Kernel changes vs v6.6 + device defconfig
+artifacts/  Flashable images (boot_bt_iommu*.img) and kernel modules (.ko)
+tools/      mkbootimg/mkdtbh (packaging), acm.py/send_b64.py (serial)
+docs/       Handover docs, progress notes, technical analysis
+rootfs/     On-device config (.bash_profile, monitors.xml, ...)
 ```
 
-## 构建 / 刷写
+## Build / flash
 
 ```bash
-# 构建（需 aarch64 工具链；路径不能含空格）
+# Build (needs an aarch64 toolchain; paths must not contain spaces)
 T=/path/to/linux-6.6
 export HOSTCFLAGS="-I.../hostinclude -I.../openssl@3/include"
 export HOSTLDFLAGS="-L.../openssl@3/lib"
 cd $T && gmake ARCH=arm64 CROSS_COMPILE=<toolchain>/bin/aarch64-linux-gnu- -j8 Image modules dtbs
 
-# 打包（DT 改动必须先转 DTBH）
+# Package (DT changes must be converted to a DTBH first)
 python3 tools/mkdtbh.py $T/arch/arm64/boot/dts/exynos/exynos7420-zenlte.dtb new_dt.img
 python3 tools/mkbootimg_7420.py $T/arch/arm64/boot/Image <ramdisk.cpio.gz> new_dt.img boot.img
 
-# 刷写（TWRP + adb）
+# Flash (TWRP + adb)
 adb push boot.img /tmp/boot.img
 adb shell "dd if=/tmp/boot.img of=/dev/block/sda7 bs=4096; sync"
 ```
 
-## 已知限制
+## Known limitations
 
-- **Panfrost (Mali-T760 r0p1)** 在 mainline 下仍有深层问题：GPU 渲染的 GTK4/WebKit 表面
-  在窗口化合成时可能出现重影/堆叠。当前通过 `GSK_RENDERER=cairo` 让这些应用走软件渲染
-  （合成器仍 GPU 加速），保证完全无瑕疵。`patches/` 已含 GPU bus/async-bridge 时钟修复，
-  可继续在此基础上深挖（`aclk_lh_g3d0/1` 已补，后续可考虑完整 G3D 电源域序列）。
-- `boot_bt_iommu19.img` 含 async-bridge 时钟修复，尚未实测。
-- 设备当前无网络自动连接；串口传输大文件较慢。
+- **Panfrost (Mali-T760 r0p1)** still has deep issues on mainline:
+  GPU-rendered GTK4/WebKit surfaces can show ghosting/stacking when composited
+  in windowed mode.  Currently those toolkits are software-rendered
+  (`GSK_RENDERER=cairo`) while the compositor stays on the GPU, which is
+  artifact-free.  `patches/` already contains the GPU bus/async-bridge clock
+  fixes; further work could add the full G3D power-domain sequence.
+- `boot_bt_iommu19.img` contains the async-bridge clock fix and has not been
+  tested on hardware yet.
+- The device does not auto-connect to a network; transferring large files over
+  the serial console is slow.
 
-## 硬件
+## Hardware
 
-- SoC: Samsung Exynos7420 (4×Cortex-A57 + 4×Cortex-A53)
+- SoC: Samsung Exynos7420 (4× Cortex-A57 + 4× Cortex-A53)
 - GPU: ARM Mali-T760 MP8
-- 显示: 1440×2560 MIPI-DSI 命令模式 (i80), DECON `13930000`, SYSMMU `13a00000`/`13a10000`
-- 触摸: STMicroelectronics stmfts (i2c-2 @0x49)
-- WiFi/BT: Broadcom BCM4359 (PCIe) / BCM4349B1 (UART4)
+- Display: 1440×2560 MIPI-DSI command mode (i80), DECON `13930000`,
+  SYSMMU `13a00000`/`13a10000`
+- Touch: STMicroelectronics stmfts (i2c-2 @0x49)
+- Wi-Fi/BT: Broadcom BCM4359 (PCIe) / BCM4349B1 (UART4)
 
-## 联系 / Contact
+## Contact
 
-- 邮箱 / Email: **1018514521@qq.com**
+- Email: **1018514521@qq.com**
 
-欢迎交流 Exynos7420 / mainline Linux / Panfrost 相关问题。
+Feedback and discussion about Exynos7420 / mainline Linux / Panfrost are welcome.

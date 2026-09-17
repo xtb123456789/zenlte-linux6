@@ -1,103 +1,128 @@
-# 交接文档：显示 IOMMU + GPU 加速 + 触摸（zenlte mainline 6.6）
+# Handover: display IOMMU + GPU acceleration + touch (zenlte mainline 6.6)
 
-> 承接 `HANDOVER-IOMMU-NEXT-AGENT.md`。本文件记录显示 IOMMU 攻坚**完成**后的
-> 完整状态，以及随后解决的 simpledrm / 三缓冲 / GPU / 触摸问题。
+> Follows on from `HANDOVER-IOMMU-NEXT-AGENT.md`.  This document records the
+> complete state after the display IOMMU work **finished**, plus the
+> simpledrm / triple-buffer / GPU / touch issues solved afterwards.
 
-## 0. 一句话现状
+## 0. One-line status
 
-**显示 IOMMU/SYSMMU、GPU 合成、触摸点击、2x 缩放、单显示器全部正常。**
-GTK4/WebKit 应用当前走软件渲染（`GSK_RENDERER=cairo`）以规避 Panfrost T760 的
-深层渲染问题；合成器（Mutter）走 GPU 加速。
+**Display IOMMU/SYSMMU, GPU compositing, touch taps, 2x scaling and the
+single-display setup all work.**  GTK4/WebKit apps currently use software
+rendering (`GSK_RENDERER=cairo`) to avoid the deeper Panfrost T760 rendering
+issues; the compositor (Mutter) is GPU-accelerated.
 
-## 1. 最终生效配置
+## 1. Final working configuration
 
-### 1.1 内核 patch（见 `patches/zenlte-mainline-6.6.patch`）
+### 1.1 Kernel patches (see `patches/zenlte-mainline-6.6.patch`)
 
 **`drivers/iommu/exynos-iommu.c`**
-- probe 静态 `MAKE_MMU_VER(6,0)` + `sysmmu_v5_variant`，不读版本寄存器
-- `struct exynos_iommu_owner` 加 `bool ready`
-- `exynos_sysmmu_resume()`：仅当 `owner->ready && !data->active` 才 `__sysmmu_enable()`
-- `exynos_sysmmu_suspend()`：仅当 `data->active` 才 `__sysmmu_disable()`
-- 新增导出 `exynos_iommu_master_ready()` / `exynos_iommu_map_identity()`
-- SYSMMU fault 不再 `panic()`（对齐原厂）
+- probe uses a static `MAKE_MMU_VER(6,0)` + `sysmmu_v5_variant`; no version
+  register read
+- `struct exynos_iommu_owner` gains `bool ready`
+- `exynos_sysmmu_resume()`: only `__sysmmu_enable()` when
+  `owner->ready && !data->active`
+- `exynos_sysmmu_suspend()`: only `__sysmmu_disable()` when `data->active`
+- exports `exynos_iommu_master_ready()` / `exynos_iommu_map_identity()`
+- SYSMMU faults no longer `panic()` (match vendor)
 
 **`arch/arm64/boot/dts/exynos/exynos7.dtsi`**
-- `sysmmu_disp_ro/rw`：`clock-names = "aclk","pclk","master"`，`master = CLK_ACLK_DECON0`
-- DECON `iommus = <&sysmmu_disp_ro>, <&sysmmu_disp_rw>`，无 `power-domains`
-- `gpu@14ac0000`：`clock-names = "core","bus"`，`bus = CLK_PCLK_SYSREG_G3D`
+- `sysmmu_disp_ro/rw`: `clock-names = "aclk","pclk","master"`, with
+  `master = CLK_ACLK_DECON0`
+- DECON `iommus = <&sysmmu_disp_ro>, <&sysmmu_disp_rw>`, no `power-domains`
+- `gpu@14ac0000`: `clock-names = "core","bus"`, `bus = CLK_PCLK_SYSREG_G3D`
 
 **`drivers/clk/samsung/clk-exynos7.c`**
-- CMU_DISP 4 个 SYSMMU 门控（`0x0804/0808/0904/0908` bit0）
-- CMU_CCORE 补 `aclk_lh_g3d0/1`（`ENABLE_ACLK_CCORE0` bit22/23，`CLK_IS_CRITICAL`）
+- four CMU_DISP SYSMMU gates (`0x0804/0808/0904/0908` bit0)
+- CMU_CCORE: add `aclk_lh_g3d0/1` (`ENABLE_ACLK_CCORE0` bits 22/23,
+  `CLK_IS_CRITICAL`)
 
 **`drivers/gpu/drm/exynos/`**
-- `exynos7_drm_decon.c`：`decon_atomic_enable()` 里对 bootloader fb 调
-  `exynos_iommu_map_identity()` + `exynos_iommu_master_ready()`；
-  `decon_update_plane()` 补写 `VIDW_BUF_START1/2`（三缓冲）
-- `exynos_drm_drv.c`：`exynos_drm_bind()` 开头 `drm_aperture_remove_framebuffers()`
-- `exynos_drm_dma.c`：IOMMU 未就绪且有 `iommus` 时 `-EPROBE_DEFER`
+- `exynos7_drm_decon.c`: in `decon_atomic_enable()` call
+  `exynos_iommu_map_identity()` + `exynos_iommu_master_ready()` for the
+  bootloader fb; in `decon_update_plane()` also write `VIDW_BUF_START1/2`
+  (triple buffering)
+- `exynos_drm_drv.c`: `drm_aperture_remove_framebuffers()` at the start of
+  `exynos_drm_bind()`
+- `exynos_drm_dma.c`: return `-EPROBE_DEFER` when the IOMMU is not ready but
+  `iommus` is present
 
-**`drivers/pmdomain/samsung/exynos-pm-domains.c`**：`samsung,exynos7420-pd`（**缺 TZPC SMC，勿真用**）
+**`drivers/pmdomain/samsung/exynos-pm-domains.c`**: `samsung,exynos7420-pd`
+(**missing the TZPC SMC — do not actually use it**)
 
-### 1.2 设备侧 rootfs
+### 1.2 On-device rootfs
 
-**`/root/.bash_profile`**（见 `rootfs/bash_profile`）
+**`/root/.bash_profile`** (see `rootfs/bash_profile`)
 ```
 GSK_RENDERER=cairo
 WEBKIT_DISABLE_DMABUF_RENDERER=1
 WEBKIT_DISABLE_COMPOSITING_MODE=1
 PAN_MESA_DEBUG=noafbc,nocrc
 ```
-启动 `gnome-shell --wayland --display-server --no-x11`（`dbus-run-session`）。
+starts `gnome-shell --wayland --display-server --no-x11` (via `dbus-run-session`).
 
-**`/root/.config/monitors.xml`**：`VGA-1`（exynos）`scale=2`，`1440x2560@59.8`
+**`/root/.config/monitors.xml`**: `VGA-1` (exynos) `scale=2`, `1440x2560@59.8`
 
-**`gsettings`**：`org.gnome.mutter experimental-features = []`（关 `scale-monitor-framebuffer`）
+**`gsettings`**: `org.gnome.mutter experimental-features = []`
+(disables `scale-monitor-framebuffer`)
 
-**systemd**：`exynos7420-gpu-pm.service`（GPU `power/control=on`，缓解 panfrost 超时）
+**systemd**: `exynos7420-gpu-pm.service` (GPU `power/control=on`, mitigates
+panfrost timeouts)
 
-## 2. 镜像
+## 2. Images
 
-| 镜像 | 内容 | 状态 |
+| Image | Contents | Status |
 |---|---|---|
-| `boot_bt_iommu17.img` | IOMMU + master 时钟 + 恒等映射 + 非致命 fault | ✅ 可用 |
-| `boot_bt_iommu18.img` | + GPU `bus` 时钟（DTS） | ✅ 可用 |
-| `boot_bt_iommu19.img` | + `aclk_lh_g3d0/1`（Image） | 未实测 |
-| `boot_bt_iommu_mod2.img` | 旧的软件渲染稳定版 | ✅ 回退用 |
+| `boot_bt_iommu17.img` | IOMMU + master clock + identity map + non-fatal faults | ✅ works |
+| `boot_bt_iommu18.img` | + GPU `bus` clock (DTS) | ✅ works |
+| `boot_bt_iommu19.img` | + `aclk_lh_g3d0/1` (Image) | untested |
+| `boot_bt_iommu_mod2.img` | older software-render stable build | ✅ fallback |
 
-DRM 模块：`exynosdrm-simpledrm-fix.ko`（含 simpledrm 移除 + 三缓冲修复）
-装入 `/lib/modules/6.6.0/extra/exynosdrm.ko`。
+DRM module: `exynosdrm-simpledrm-fix.ko` (simpledrm removal + triple-buffer
+fix), installed as `/lib/modules/6.6.0/extra/exynosdrm.ko`.
 
-## 3. 关键结论 / 踩坑
+## 3. Key findings / pitfalls
 
-1. **SYSMMU 使能时机**：DECON runtime-resume 时 DECON 还在扫 bootloader 物理 fb，
-   此时使能 SYSMMU → fault/挂总线。必须先恒等映射旧 fb（或 mask trigger 等帧结束），
-   再使能。
-2. **master 时钟必需**：SYSMMU 节点缺 `master`（DECON aclk）时，CCF 使能 pclk 会挂。
-3. **simpledrm 必须移除**：否则 GNOME 看到 2 个显示设备 → 触摸自动映射/缩放错乱
-   （`drm_aperture_remove_framebuffers()`）。
-4. **`scale-monitor-framebuffer` 实验特性**：开启时 2x 缩放触摸映射错乱，必须关闭。
-5. **三缓冲**：`WINCONx_TRIPLE_BUF_MODE` 必须同时写 `BUF_START/START1/START2`。
-6. **GPU `bus` 时钟**：`pclk_sysreg_g3d` mainline 从不使能 → panfrost 超时。
-7. **Panfrost T760 r0p1**：AFBC/CRC/tiling 路径会导致 fragment job 卡死 / tile 重影，
-   用 `PAN_MESA_DEBUG=noafbc,nocrc` 缓解；彻底修复需补全 G3D 电源域序列
-   （原厂 `save_list_g3d`、`aclk_lh_g3d0/1`）或 Mesa 侧改动。
-8. **DTBH**：DT 改动必须 `mkdtbh.py` 重新打包，否则不生效。
-9. **串口**：大文件用 gzip + base64 传（`send_b64.py`），否则很慢。
+1. **SYSMMU enable timing**: at DECON runtime-resume the DECON is still
+   scanning the bootloader's physical fb; enabling the SYSMMU then faults /
+   wedges the bus.  Identity-map the old fb first (or mask the trigger and wait
+   for the frame to finish) before enabling.
+2. **The `master` clock is required**: without `master` (= DECON aclk) on the
+   SYSMMU node, the CCF hangs when enabling `pclk`.
+3. **simpledrm must be removed**: otherwise GNOME sees two display devices and
+   touch auto-mapping / scaling break
+   (`drm_aperture_remove_framebuffers()`).
+4. **`scale-monitor-framebuffer` experimental feature**: with it enabled, touch
+   mapping breaks at 2x scale; disable it.
+5. **Triple buffering**: `WINCONx_TRIPLE_BUF_MODE` requires writing
+   `BUF_START/START1/START2`.
+6. **GPU `bus` clock**: `pclk_sysreg_g3d` is never enabled by mainline →
+   panfrost timeouts.
+7. **Panfrost T760 r0p1**: AFBC/CRC/tiling paths make fragment jobs hang and
+   tiles ghost; mitigate with `PAN_MESA_DEBUG=noafbc,nocrc`.  A full fix needs
+   the complete G3D power-domain sequence (vendor `save_list_g3d`,
+   `aclk_lh_g3d0/1`) or a Mesa change.
+8. **DTBH**: DT changes must be repacked with `mkdtbh.py` or they will not take
+   effect.
+9. **Serial**: transfer large files with gzip + base64 (`send_b64.py`),
+   otherwise it is very slow.
 
-## 4. 建议下一步
+## 4. Suggested next steps
 
-1. 刷 `boot_bt_iommu19.img`，验证 `aclk_lh_g3d0/1` 是否让 GPU 更稳（配合 Mesa 选项）。
-2. 若仍重影：实现完整 `exynos7420_g3d_cfg` 电源域序列（top/local 时钟、sys_pwr、
-   save/restore），参考 `kernel/arch/arm64/mach-exynos/pm_domains-exynos7420*.{c,h}`。
-3. 修正 `pd_g3d` 基址（mainline `0x105c4060` 实为 CAM1，原厂 G3D 为 `0x105c4100`）。
-4. 音频（见 `HANDOVER-audio.md`）。
+1. Flash `boot_bt_iommu19.img` and check whether `aclk_lh_g3d0/1` makes the GPU
+   more stable (together with the Mesa options).
+2. If ghosting persists: implement the full `exynos7420_g3d_cfg` power-domain
+   sequence (top/local clocks, sys_pwr, save/restore), referencing
+   `kernel/arch/arm64/mach-exynos/pm_domains-exynos7420*.{c,h}`.
+3. Fix the `pd_g3d` base address (mainline `0x105c4060` is actually CAM1; the
+   vendor G3D is `0x105c4100`).
+4. Audio (see `HANDOVER-audio.md`).
 
-## 5. 环境
+## 5. Environment
 
-- 内核树 `/Volumes/kernel_build/linux-6.6`（sparseimage：
-  `~/.gemini/antigravity/scratch/kernel_build.sparseimage`，**不是** xtb 里的备份）
-- 厂商树 `/Volumes/kernel_build/kernel`（3.10.61）
-- 构建：`gmake ARCH=arm64 CROSS_COMPILE=<aarch64-toolchain>/bin/aarch64-linux-gnu- -j8 Image modules dtbs`
-- 串口 `/dev/cu.usbmodem2301`（系统）/ `2302`（TWRP）
-- 刷机 TWRP：`adb push ...; adb shell "dd if=/tmp/boot.img of=/dev/block/sda7 bs=4096; sync"`
+- Kernel tree `/Volumes/kernel_build/linux-6.6` (sparseimage:
+  `~/.gemini/antigravity/scratch/kernel_build.sparseimage`, **not** the backup
+  under `xtb/`)
+- Vendor tree `/Volumes/kernel_build/kernel` (3.10.61)
+- Build: `gmake ARCH=arm64 CROSS_COMPILE=<aarch64-toolchain>/bin/aarch64-linux-gnu- -j8 Image modules dtbs`
+- Serial `/dev/cu.usbmodem2301` (system) / `2302` (TWRP)
+- Flashing via TWRP: `adb push ...; adb shell "dd if=/tmp/boot.img of=/dev/block/sda7 bs=4096; sync"`
