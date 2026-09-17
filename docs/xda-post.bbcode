@@ -1,0 +1,70 @@
+[B][SIZE=5][SM-G9280/G928] Mainline Linux 6.6 + Ubuntu 24.04 + GNOME 46 on the Galaxy S6 Edge+ (Exynos7420)[/SIZE][/B]
+
+[CENTER][IMG]https://raw.githubusercontent.com/xtb123456789/zenlte-linux6/main/docs/screenshots/ubuntu-24.04-gnome46-mali-t760.jpg[/IMG]
+
+[B]Ubuntu 24.04.5 LTS + GNOME 46 (Wayland) + Linux 6.6.0, GPU: Mali-T760 (Panfrost), 8 cores (4x A53 + 4x A57)[/B][/CENTER]
+
+[B]Repository:[/B] [URL]https://github.com/xtb123456789/zenlte-linux6[/URL]
+
+[SIZE=4][B]What this is[/B][/SIZE]
+
+A work-in-progress mainline Linux 6.6 port for the Samsung Galaxy S6 Edge+ (SM-G9280, codename zenlte, Exynos7420). The repo contains the full kernel patch set, flashable boot images, packaging tools and detailed documentation.
+
+[SIZE=4][B]What works[/B][/SIZE]
+
+[LIST]
+[*]Boot on all 8 cores (Exynos7420)
+[*][B]Display via mainline DRM (Exynos DECON) with the SYSMMU/IOMMU attached[/B]
+[*][B]GPU hardware acceleration: Mali-T760 (Panfrost), Mutter GPU-composited (glmark2 900+ FPS)[/B]
+[*]Touch (STMicroelectronics stmfts) - taps, gestures, 2x scaling
+[*]GNOME 46 desktop (Wayland)
+[*]Wi-Fi (BCM4359, PCIe) and Bluetooth (BCM4349B1, UART4/LPASS)
+[*]Firefox/Epiphany (software-rendered toolkits for now - see below)
+[/LIST]
+
+[SIZE=4][B]The interesting part: display IOMMU/SYSMMU[/B][/SIZE]
+
+The Exynos7420 DECON (13930000.decon) is wired to SYSMMU v6 (13a00000 RO, 13a10000 RW). Getting mainline's exynos-iommu driver to work required several fixes, all documented in the repo:
+
+[LIST=1]
+[*][B]No version-register read at probe[/B] - it wedges the bus while the DISP power domain is off; use a static version instead.
+[*][B]Deferred SYSMMU enable[/B] - do not enable on the DECON runtime-resume path (DECON is still scanning the bootloader's physical framebuffer); wait until the DECON driver has programmed an IOVA-mapped framebuffer.
+[*][B]Identity-map the bootloader framebuffer[/B] (vendor iovmm_map_oto semantics) so the DECON can keep scanning its old physical framebuffer once the SYSMMU starts translating.
+[*][B]Wire the SYSMMU "master" clock[/B] (= DECON aclk), otherwise the clock framework hangs when enabling the SYSMMU pclk.
+[*][B]Remove the conflicting simpledrm[/B] (drm_aperture_remove_framebuffers) - otherwise userspace sees two display devices and touch mapping / scaling break.
+[*][B]Fix the DECON triple-buffer setup[/B] - the driver set WINCONx_TRIPLE_BUF_MODE but never wrote BUF_START1/2, causing flicker on every repaint.
+[/LIST]
+
+[SIZE=4][B]GPU (Panfrost / Mali-T760)[/B][/SIZE]
+
+The GPU also needed fixes: the mainline GPU node never enables the G3D bus/sysreg clock (CLK_PCLK_SYSREG_G3D) nor the async-bridge clocks (aclk_lh_g3d0/1), and Mali-T760 r0p1 hits "gpu sched timeout" on AFBC/CRC render passes. The repo includes the clock/DT fixes plus the Mesa workaround (PAN_MESA_DEBUG=noafbc,nocrc).
+
+[B]Known limitation:[/B] GPU-rendered GTK4/WebKit surfaces can still ghost when composited in windowed mode, so those toolkits are currently software-rendered (GSK_RENDERER=cairo) while the compositor stays on the GPU. This is a Panfrost T760 issue, not the display IOMMU.
+
+[SIZE=4][B]Contents[/B][/SIZE]
+
+[LIST]
+[*]patches/ - kernel changes vs v6.6 + device defconfig
+[*]artifacts/ - flashable boot images (boot_bt_iommu*.img) + kernel modules
+[*]tools/ - mkbootimg/mkdtbh (DTBH packaging), serial tools
+[*]docs/ - handover docs and technical analysis
+[*]rootfs/ - on-device config (.bash_profile, monitors.xml, ...)
+[/LIST]
+
+[SIZE=4][B]Build / flash[/B][/SIZE]
+
+[CODE]
+gmake ARCH=arm64 CROSS_COMPILE=<aarch64-toolchain>/bin/aarch64-linux-gnu- -j8 Image modules dtbs
+python3 tools/mkdtbh.py <dtb> new_dt.img
+python3 tools/mkbootimg_7420.py Image ramdisk.cpio.gz new_dt.img boot.img
+adb push boot.img /tmp/boot.img
+adb shell "dd if=/tmp/boot.img of=/dev/block/sda7 bs=4096; sync"
+[/CODE]
+
+[SIZE=4][B]Status / disclaimer[/B][/SIZE]
+
+This is experimental and definitely not a daily-driver yet (no working telephony/audio yet). Everything is documented so others can continue the work. Feedback and pull requests welcome.
+
+[B]Contact:[/B] 1018514521@qq.com
+
+[B]Repository:[/B] [URL]https://github.com/xtb123456789/zenlte-linux6[/URL]
